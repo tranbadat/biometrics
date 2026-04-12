@@ -1,31 +1,510 @@
 <!doctype html>
-<html>
-  <head>
-    <meta charset="utf-8" />
-    <title>2D Face+Mask PoC</title>
-    <style>
-      body { font-family: Arial, sans-serif; max-width: 900px; margin: 20px auto; }
-      video, canvas { border: 1px solid #ccc; }
-    </style>
-  </head>
-  <body>
-    <h2>2D Face Recognition + Mask Detection (PoC)</h2>
+<html lang="vi">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Hệ thống Nhận diện Khuôn mặt</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
-    <section>
-      <h3>Webcam (Real-time capture)</h3>
-      <video id="video" width="480" height="360" autoplay muted></video>
-      <canvas id="overlay" width="480" height="360"></canvas>
-      <div>
-        <button id="captureBtn">Capture & Send</button>
+    :root {
+      --bg:        #0f1117;
+      --surface:   #1a1d2e;
+      --surface2:  #242740;
+      --border:    #2e3250;
+      --accent:    #4f8ef7;
+      --accent2:   #7c5cbf;
+      --green:     #22c55e;
+      --red:       #ef4444;
+      --yellow:    #f59e0b;
+      --text:      #e2e8f0;
+      --muted:     #7c8db5;
+      --radius:    10px;
+      --font:      'Segoe UI', system-ui, sans-serif;
+    }
+
+    body {
+      font-family: var(--font);
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* ── Header ── */
+    header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 0 24px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      height: 56px;
+      flex-shrink: 0;
+    }
+    header h1 { font-size: 16px; font-weight: 600; color: var(--text); }
+    header .badge {
+      font-size: 11px; background: var(--accent2);
+      color: #fff; padding: 2px 8px; border-radius: 20px;
+    }
+
+    /* ── Tab bar ── */
+    .tabs {
+      display: flex;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 0 24px;
+      gap: 4px;
+    }
+    .tab-btn {
+      padding: 12px 20px;
+      border: none; background: none;
+      color: var(--muted); font-size: 13px; font-weight: 500;
+      cursor: pointer; border-bottom: 2px solid transparent;
+      transition: all .2s; display: flex; align-items: center; gap: 7px;
+    }
+    .tab-btn:hover { color: var(--text); }
+    .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
+    .tab-btn .icon { font-size: 15px; }
+
+    /* ── Main content ── */
+    main { flex: 1; padding: 24px; overflow-y: auto; }
+    .tab-panel { display: none; }
+    .tab-panel.active { display: block; }
+
+    /* ── Cards ── */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px;
+      margin-bottom: 16px;
+    }
+    .card-title {
+      font-size: 13px; font-weight: 600;
+      color: var(--muted); text-transform: uppercase;
+      letter-spacing: .6px; margin-bottom: 16px;
+    }
+
+    /* ── Form ── */
+    .form-row { display: flex; gap: 12px; margin-bottom: 14px; }
+    .form-group { flex: 1; display: flex; flex-direction: column; gap: 6px; }
+    label { font-size: 12px; color: var(--muted); font-weight: 500; }
+    input[type=text] {
+      background: var(--surface2); border: 1px solid var(--border);
+      border-radius: 6px; color: var(--text);
+      padding: 9px 12px; font-size: 14px; outline: none;
+      transition: border-color .2s;
+    }
+    input[type=text]:focus { border-color: var(--accent); }
+
+    /* ── Buttons ── */
+    .btn {
+      padding: 9px 18px; border-radius: 6px; border: none;
+      font-size: 13px; font-weight: 600; cursor: pointer;
+      display: inline-flex; align-items: center; gap: 7px;
+      transition: opacity .15s, transform .1s;
+    }
+    .btn:active { transform: scale(.97); }
+    .btn:disabled { opacity: .4; cursor: not-allowed; }
+    .btn-primary { background: var(--accent); color: #fff; }
+    .btn-primary:hover:not(:disabled) { opacity: .88; }
+    .btn-success { background: var(--green); color: #fff; }
+    .btn-success:hover:not(:disabled) { opacity: .88; }
+    .btn-danger  { background: var(--red); color: #fff; }
+    .btn-outline {
+      background: transparent; color: var(--text);
+      border: 1px solid var(--border);
+    }
+    .btn-outline:hover { background: var(--surface2); }
+
+    /* ── Camera view ── */
+    .camera-wrap {
+      position: relative; border-radius: 8px;
+      overflow: hidden; background: #000;
+      display: inline-block; line-height: 0;
+    }
+    .camera-wrap video,
+    .camera-wrap canvas { display: block; width: 100%; max-width: 560px; }
+    .camera-wrap .cam-overlay {
+      position: absolute; inset: 0;
+      pointer-events: none;
+    }
+
+    /* ── Progress bar ── */
+    .progress-wrap { margin: 14px 0; }
+    .progress-label {
+      display: flex; justify-content: space-between;
+      font-size: 12px; color: var(--muted); margin-bottom: 6px;
+    }
+    .progress-bar {
+      height: 6px; background: var(--surface2);
+      border-radius: 3px; overflow: hidden;
+    }
+    .progress-fill {
+      height: 100%; background: var(--accent);
+      border-radius: 3px; transition: width .3s;
+    }
+    .progress-fill.done { background: var(--green); }
+
+    /* ── Thumbnail grid ── */
+    .thumb-grid {
+      display: flex; flex-wrap: wrap; gap: 8px;
+      max-height: 260px; overflow-y: auto;
+      padding: 4px;
+    }
+    .thumb-item {
+      position: relative; width: 80px; height: 64px;
+      border-radius: 5px; overflow: hidden;
+      border: 2px solid var(--border);
+      flex-shrink: 0;
+    }
+    .thumb-item img { width: 100%; height: 100%; object-fit: cover; }
+    .thumb-item .quality-badge {
+      position: absolute; top: 2px; right: 2px;
+      width: 16px; height: 16px; border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 9px; font-weight: bold;
+    }
+    .thumb-item .quality-badge.good  { background: var(--green); color: #fff; }
+    .thumb-item .quality-badge.warn  { background: var(--yellow); color: #000; }
+    .thumb-item .quality-badge.bad   { background: var(--red);   color: #fff; }
+    .thumb-item .remove-btn {
+      position: absolute; bottom: 2px; right: 2px;
+      background: rgba(0,0,0,.6); border: none; border-radius: 3px;
+      color: #fff; font-size: 10px; padding: 1px 4px;
+      cursor: pointer; display: none;
+    }
+    .thumb-item:hover .remove-btn { display: block; }
+    .thumb-item.good  { border-color: var(--green); }
+    .thumb-item.warn  { border-color: var(--yellow); }
+    .thumb-item.bad   { border-color: var(--red); }
+
+    /* ── Tab 2: Layout nhận diện ── */
+    .recog-layout {
+      display: grid;
+      grid-template-columns: 560px 1fr;
+      gap: 16px;
+      align-items: start;
+    }
+    @media (max-width: 900px) {
+      .recog-layout { grid-template-columns: 1fr; }
+    }
+
+    .result-panel { display: flex; flex-direction: column; gap: 12px; }
+
+    .result-identity {
+      font-size: 22px; font-weight: 700;
+      display: flex; align-items: center; gap: 10px;
+    }
+
+    .badge-mask, .badge-nomask, .badge-unknown {
+      font-size: 12px; font-weight: 600;
+      padding: 3px 10px; border-radius: 20px;
+    }
+    .badge-mask    { background: rgba(34,197,94,.15); color: var(--green); border: 1px solid var(--green); }
+    .badge-nomask  { background: rgba(239,68,68,.15);  color: var(--red);   border: 1px solid var(--red); }
+    .badge-unknown { background: rgba(124,141,181,.15); color: var(--muted); border: 1px solid var(--border); }
+
+    .result-row {
+      display: flex; justify-content: space-between;
+      font-size: 13px; padding: 8px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .result-row:last-child { border-bottom: none; }
+    .result-row .key { color: var(--muted); }
+    .result-row .val { font-weight: 600; }
+
+    .conf-bar { width: 80px; height: 6px; background: var(--surface2); border-radius: 3px; overflow: hidden; display: inline-block; vertical-align: middle; margin-left: 8px; }
+    .conf-fill { height: 100%; border-radius: 3px; background: var(--accent); }
+
+    /* ── Upload toggle ── */
+    .input-toggle {
+      display: flex; gap: 8px; margin-bottom: 16px;
+    }
+    .toggle-btn {
+      flex: 1; padding: 8px; border-radius: 6px;
+      border: 1px solid var(--border); background: var(--surface2);
+      color: var(--muted); font-size: 13px; cursor: pointer;
+      text-align: center; transition: all .2s;
+    }
+    .toggle-btn.active {
+      background: var(--accent); border-color: var(--accent);
+      color: #fff;
+    }
+
+    /* ── Tab 3: Logs ── */
+    .log-list { display: flex; flex-direction: column; gap: 10px; }
+    .log-card {
+      background: var(--surface2); border: 1px solid var(--border);
+      border-radius: 8px; padding: 14px;
+      display: grid; grid-template-columns: 90px 1fr auto;
+      gap: 14px; align-items: center;
+    }
+    .log-thumb {
+      width: 90px; height: 68px; border-radius: 5px;
+      object-fit: cover; background: #000;
+    }
+    .log-thumb canvas { width: 90px; height: 68px; border-radius: 5px; }
+    .log-info { display: flex; flex-direction: column; gap: 4px; }
+    .log-name { font-size: 15px; font-weight: 600; }
+    .log-time { font-size: 11px; color: var(--muted); }
+    .log-meta { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-top: 4px; }
+    .log-steps {
+      display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px;
+    }
+    .log-step-img {
+      width: 72px; height: 54px; object-fit: cover;
+      border-radius: 4px; border: 1px solid var(--border);
+      cursor: pointer;
+    }
+    .log-step-label { font-size: 10px; color: var(--muted); text-align: center; }
+    .step-item { display: flex; flex-direction: column; gap: 2px; }
+    .log-conf { font-size: 12px; color: var(--muted); }
+
+    /* ── Toast ── */
+    #toast {
+      position: fixed; bottom: 24px; right: 24px;
+      background: var(--surface2); border: 1px solid var(--border);
+      border-radius: 8px; padding: 12px 18px;
+      font-size: 13px; box-shadow: 0 8px 32px rgba(0,0,0,.5);
+      transform: translateY(20px); opacity: 0;
+      transition: all .25s; z-index: 999; max-width: 320px;
+    }
+    #toast.show { transform: translateY(0); opacity: 1; }
+    #toast.success { border-color: var(--green); color: var(--green); }
+    #toast.error   { border-color: var(--red);   color: var(--red); }
+
+    /* ── Status dot ── */
+    .status-dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      display: inline-block; margin-right: 6px;
+    }
+    .dot-green  { background: var(--green); box-shadow: 0 0 6px var(--green); }
+    .dot-yellow { background: var(--yellow); }
+    .dot-red    { background: var(--red); }
+
+    /* ── Spinner ── */
+    .spinner {
+      display: inline-block; width: 14px; height: 14px;
+      border: 2px solid rgba(255,255,255,.3);
+      border-top-color: #fff; border-radius: 50%;
+      animation: spin .6s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── Empty state ── */
+    .empty-state {
+      text-align: center; padding: 48px 16px;
+      color: var(--muted); font-size: 14px;
+    }
+    .empty-state .icon { font-size: 40px; margin-bottom: 12px; }
+
+    .btn-row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 14px; }
+    .hint { font-size: 12px; color: var(--muted); margin-top: 8px; }
+    .section-gap { height: 8px; }
+
+    input[type=file] { display: none; }
+  </style>
+</head>
+<body>
+
+<header>
+  <span style="font-size:20px">🎭</span>
+  <h1>Hệ thống Nhận diện Khuôn mặt có Đeo Khẩu trang</h1>
+  <span class="badge">PoC v1.0</span>
+</header>
+
+<div class="tabs">
+  <button class="tab-btn active" id="tab-btn-enroll">
+    <span class="icon">👤</span> Đăng ký khuôn mặt
+  </button>
+  <button class="tab-btn" id="tab-btn-recog">
+    <span class="icon">🔍</span> Nhận diện
+  </button>
+  <button class="tab-btn" id="tab-btn-logs">
+    <span class="icon">📋</span> Lịch sử
+    <span id="log-count" style="background:var(--accent);color:#fff;font-size:10px;padding:1px 6px;border-radius:10px;display:none"></span>
+  </button>
+</div>
+
+<main>
+
+  <!-- ══════════════ TAB 1: ENROLL ══════════════ -->
+  <div id="tab-enroll" class="tab-panel active">
+
+    <div class="card">
+      <div class="card-title">Thông tin người dùng</div>
+      <div class="form-row">
+        <div class="form-group">
+          <label>Họ và tên *</label>
+          <input type="text" id="enroll-name" placeholder="VD: Nguyễn Văn A" />
+        </div>
+        <div class="form-group">
+          <label>Mã người dùng *</label>
+          <input type="text" id="enroll-id" placeholder="VD: NV001" />
+        </div>
       </div>
-    </section>
+      <p class="hint">* Mã người dùng sẽ dùng làm tên thư mục lưu ảnh: <code>data/faces/{mã}/</code></p>
+    </div>
 
-    <section>
-      <h3>Upload Image</h3>
-      <input type="file" id="fileInput" accept="image/*" />
-      <canvas id="uploadCanvas" width="480" height="360"></canvas>
-    </section>
+    <div style="display:grid;grid-template-columns:auto 1fr;gap:16px;align-items:start">
 
-    <script src="main.js"></script>
-  </body>
+      <div>
+        <div class="card" style="padding:14px">
+          <div class="card-title">Camera</div>
+          <div class="camera-wrap">
+            <video id="enroll-video" width="400" height="300" autoplay muted playsinline></video>
+            <canvas id="enroll-preview" width="400" height="300" style="display:none;position:absolute;top:0;left:0"></canvas>
+          </div>
+          <div class="btn-row">
+            <button class="btn btn-primary" id="enroll-capture-btn">
+              📷 Chụp ảnh
+            </button>
+            <button class="btn btn-outline">🗑 Xóa tất cả</button>
+          </div>
+          <p class="hint" style="margin-top:10px">Cần ít nhất <strong>15 ảnh tốt</strong>. Đa dạng góc và ánh sáng.</p>
+        </div>
+      </div>
+
+      <div>
+        <div class="card">
+          <div class="card-title">Ảnh đã chụp</div>
+
+          <div class="progress-wrap">
+            <div class="progress-label">
+              <span id="enroll-progress-label">0 / 15 ảnh tốt</span>
+              <span id="enroll-quality-label" style="color:var(--muted)">—</span>
+            </div>
+            <div class="progress-bar">
+              <div class="progress-fill" id="enroll-progress-fill" style="width:0%"></div>
+            </div>
+          </div>
+
+          <div class="thumb-grid" id="enroll-thumb-grid">
+            <div class="empty-state" id="enroll-empty" style="padding:20px;width:100%">
+              <div class="icon">📷</div>
+              Chưa có ảnh nào. Nhấn "Chụp ảnh" để bắt đầu.
+            </div>
+          </div>
+
+          <div class="btn-row" style="margin-top:16px;border-top:1px solid var(--border);padding-top:14px">
+            <button class="btn btn-success" id="enroll-save-btn" disabled>
+              💾 Lưu và Đăng ký
+            </button>
+            <span id="enroll-status" style="font-size:12px;color:var(--muted);align-self:center"></span>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ══════════════ TAB 2: NHẬN DIỆN ══════════════ -->
+  <div id="tab-recog" class="tab-panel">
+
+    <div class="recog-layout">
+
+      <div>
+        <div class="card" style="padding:14px">
+          <div class="card-title">Nguồn ảnh</div>
+          <div class="input-toggle">
+            <div class="toggle-btn active" id="toggle-cam">📹 Camera</div>
+            <div class="toggle-btn" id="toggle-upload">📁 Upload</div>
+          </div>
+
+          <!-- Camera mode -->
+          <div id="recog-camera-mode">
+            <div class="camera-wrap">
+              <video id="recog-video" width="560" height="420" autoplay muted playsinline></video>
+            </div>
+            <div class="btn-row">
+              <button class="btn btn-primary">📷 Chụp & Phân tích</button>
+            </div>
+          </div>
+
+          <!-- Upload mode -->
+          <div id="recog-upload-mode" style="display:none">
+            <label for="recog-file-input" class="btn btn-outline" style="cursor:pointer;display:inline-flex">
+              📁 Chọn ảnh...
+            </label>
+            <input type="file" id="recog-file-input" accept="image/*" />
+            <p class="hint" style="margin-top:8px">Hỗ trợ JPG, PNG. Kích thước tối đa 10MB.</p>
+          </div>
+
+          <!-- Result canvas -->
+          <div style="margin-top:14px">
+            <canvas id="recog-result-canvas" width="560" height="420"
+              style="display:none;border-radius:8px;border:1px solid var(--border);max-width:100%">
+            </canvas>
+          </div>
+        </div>
+      </div>
+
+      <!-- Result panel -->
+      <div class="result-panel">
+        <div class="card" id="recog-result-card">
+          <div class="card-title">Kết quả nhận diện</div>
+          <div id="recog-waiting" class="empty-state" style="padding:32px 16px">
+            <div class="icon">🔍</div>
+            Chụp ảnh hoặc upload để bắt đầu nhận diện
+          </div>
+          <div id="recog-result-detail" style="display:none">
+            <div class="result-identity" id="res-identity">—</div>
+            <div style="margin-top:8px" id="res-badges"></div>
+            <div style="margin-top:16px;display:flex;flex-direction:column;gap:0">
+              <div class="result-row">
+                <span class="key">Mã người dùng</span>
+                <span class="val" id="res-uid">—</span>
+              </div>
+              <div class="result-row">
+                <span class="key">Trạng thái khẩu trang</span>
+                <span class="val" id="res-mask">—</span>
+              </div>
+              <div class="result-row">
+                <span class="key">Độ tin cậy mask</span>
+                <span class="val" id="res-mask-conf">—</span>
+              </div>
+              <div class="result-row">
+                <span class="key">Độ tin cậy nhận diện</span>
+                <span class="val" id="res-id-conf">—</span>
+              </div>
+              <div class="result-row">
+                <span class="key">Số khuôn mặt phát hiện</span>
+                <span class="val" id="res-face-count">—</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ══════════════ TAB 3: LOGS ══════════════ -->
+  <div id="tab-logs" class="tab-panel">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+      <div style="font-size:14px;color:var(--muted)">
+        Lịch sử nhận diện trong phiên làm việc này
+      </div>
+      <button class="btn btn-outline" style="padding:6px 14px;font-size:12px">
+        🗑 Xóa lịch sử
+      </button>
+    </div>
+
+    <div class="log-list" id="log-list">
+      <div class="empty-state" id="log-empty">
+        <div class="icon">📋</div>
+        Chưa có lần nhận diện nào trong phiên này
+      </div>
+    </div>
+  </div>
+
+</main>
+
+<div id="toast"></div>
+
+<script src="main.js?v=3"></script>
+</body>
 </html>

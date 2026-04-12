@@ -106,10 +106,8 @@ def _classify_and_recognize(crop: np.ndarray, score: float, landmarks=None):
         else:
             pil_for_recog = pil_crop
     elif _HAS_PREPROCESS:
-        pil_for_recog = Image.fromarray(
-            prepare_for_embedding(crop_bgr, has_mask=False)
-            if not has_mask else pil_crop
-        )
+        # prepare_for_embedding đã trả về PIL.Image — không cần fromarray
+        pil_for_recog = prepare_for_embedding(crop_bgr, has_mask=False)
     else:
         pil_for_recog = pil_crop
 
