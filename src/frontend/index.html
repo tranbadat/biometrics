@@ -1,0 +1,31 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>2D Face+Mask PoC</title>
+    <style>
+      body { font-family: Arial, sans-serif; max-width: 900px; margin: 20px auto; }
+      video, canvas { border: 1px solid #ccc; }
+    </style>
+  </head>
+  <body>
+    <h2>2D Face Recognition + Mask Detection (PoC)</h2>
+
+    <section>
+      <h3>Webcam (Real-time capture)</h3>
+      <video id="video" width="480" height="360" autoplay muted></video>
+      <canvas id="overlay" width="480" height="360"></canvas>
+      <div>
+        <button id="captureBtn">Capture & Send</button>
+      </div>
+    </section>
+
+    <section>
+      <h3>Upload Image</h3>
+      <input type="file" id="fileInput" accept="image/*" />
+      <canvas id="uploadCanvas" width="480" height="360"></canvas>
+    </section>
+
+    <script src="main.js"></script>
+  </body>
+</html>

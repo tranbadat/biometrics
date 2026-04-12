@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+python-multipart
+Pillow
+numpy
+opencv-python
+tqdm
+requests
+pandas
+torch
+torchvision
+facenet-pytorch
+scikit-learn
+joblib
