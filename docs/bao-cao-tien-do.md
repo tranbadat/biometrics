@@ -159,7 +159,157 @@ Môi trường & DevOps                  Báo cáo & thuyết trình
 
 ---
 
-## 5. Khó khăn và cách xử lý
+## 5. Câu hỏi thường gặp
+
+### Q1: Trước khi train thì có cần làm gì với ảnh không?
+
+**Có — tiền xử lý ảnh là bắt buộc trước khi train, gồm 3 bước chính:**
+
+**Bước 1 — Lọc ảnh kém chất lượng (Laplacian variance):**
+Tính độ sắc nét bằng cách áp dụng bộ lọc Laplacian (phát hiện cạnh) lên ảnh rồi tính phương sai của kết quả. Ảnh sắc nét có nhiều cạnh → phương sai cao; ảnh mờ → phương sai thấp. Những ảnh có variance < ngưỡng bị loại khỏi tập train để tránh model học từ dữ liệu nhiễu.
+
+```
+Laplacian variance = Var( ∇²I ) = Var( I * [[0,1,0],[1,-4,1],[0,1,0]] )
+```
+
+**Bước 2 — Cân bằng sáng bằng CLAHE (Contrast Limited Adaptive Histogram Equalization):**
+Ảnh trong dataset được chụp ở nhiều điều kiện ánh sáng khác nhau (trong nhà, ngoài trời, ban đêm). CLAHE chia ảnh thành các ô nhỏ (tile), cân bằng histogram cục bộ trong từng ô thay vì toàn ảnh, giới hạn mức tương phản tối đa (clip limit). Kết quả: vùng tối rõ hơn mà vùng sáng không bị overexpose — đặc biệt quan trọng cho vùng mắt/lông mày (vùng periocular thường tối do bóng đổ).
+
+**Bước 3 — Augmentation (chỉ cho tập train, không cho val/test):**
+Áp dụng các biến đổi ngẫu nhiên để tăng tính đa dạng, giúp model không bị overfitting:
+- `RandomHorizontalFlip`: lật ngang (khuôn mặt đối xứng nên hợp lệ)
+- `ColorJitter`: thay đổi độ sáng, tương phản, bão hòa màu ngẫu nhiên
+- `RandomRotation(±15°)`: mô phỏng đầu nghiêng nhẹ
+- `GaussianBlur`: mô phỏng ảnh hơi mờ do camera không lấy nét
+- `Normalize`: chuẩn hóa về mean/std của ImageNet — bắt buộc vì dùng pretrained backbone ImageNet
+
+---
+
+### Q2: Sau khi train thì kết quả thế nào, đánh giá như thế nào?
+
+**Kết quả mong đợi với dataset Face Mask 12K (5.400 mask + 5.400 no\_mask):**
+
+| Metric | Phase 1 (cuối) | Phase 2 (cuối) | Mục tiêu |
+|---|---|---|---|
+| Train Accuracy | ~94–96% | ~97–98% | ≥ 95% |
+| Val Accuracy | ~92–95% | ~95–97% | ≥ 93% |
+| Val Loss | ~0.15 | ~0.10 | giảm đều |
+
+**Cách đánh giá:**
+
+1. **Accuracy trên val set** — tỷ lệ dự đoán đúng trên tập validation (20% dataset không dùng cho train). Metric này phù hợp vì 2 class cân bằng hoàn hảo (5.400 mỗi class).
+
+2. **Confusion Matrix** — xem mô hình nhầm theo hướng nào: nhầm "có mask" thành "không mask" nguy hiểm hơn chiều ngược lại (bỏ sót người đeo mask) trong bài toán an ninh.
+
+3. **Classification Report (Precision, Recall, F1):**
+   - Precision = TP / (TP + FP): trong số dự đoán "mask", bao nhiêu % thực sự đeo mask
+   - Recall = TP / (TP + FN): trong số người thực sự đeo mask, bao nhiêu % được phát hiện
+   - F1 = harmonic mean của Precision và Recall
+
+4. **Checkpoint lưu best val\_acc** — script train tự động lưu model có val\_acc cao nhất, không phải model ở epoch cuối cùng.
+
+---
+
+### Q3: Quá trình train thế nào? Tại sao phải chia 2 phase? Ý nghĩa của từng phase?
+
+**Kỹ thuật gọi là "2-phase Transfer Learning" (Frozen → Fine-tune):**
+
+**Vấn đề cốt lõi:** MobileNetV2 đã được pretrain trên ImageNet (1.2 triệu ảnh, 1.000 class) — backbone đã học được các đặc trưng rất tốt (cạnh, texture, hình dạng). Nếu ngay từ đầu train toàn bộ mạng với learning rate cao, các weight đã học được sẽ bị "quên" nhanh (catastrophic forgetting) trước khi classification head học được task mới.
+
+**Phase 1 — "Làm nóng" classification head (Epoch 1–15):**
+```
+Backbone (pretrained, FROZEN) → features → [Dropout(0.3) → Linear(1280→2)] (TRAIN)
+                                                                ↑
+                                              chỉ train phần này, LR = 1e-3
+```
+- **Mục đích:** Để classification head (lớp Linear cuối) học cách sử dụng các đặc trưng sẵn có của backbone cho bài toán mask vs no\_mask — *mà không làm xáo trộn backbone*.
+- Backbone bị đóng băng hoàn toàn (requires\_grad = False) → gradient không lan truyền ngược qua backbone.
+- Sau phase này, classification head đã hội tụ khá tốt.
+
+**Phase 2 — Fine-tune toàn bộ mạng (Epoch 16–25):**
+```
+Backbone (UNFREEZE) → features → classification head
+↑                                ↑
+LR = 1e-4 (nhỏ hơn 10×)         LR = 1e-4
+```
+- **Mục đích:** Tinh chỉnh toàn bộ mạng để backbone thích nghi với đặc điểm riêng của ảnh mặt người đeo khẩu trang — khác với ảnh ImageNet chung chung.
+- Learning rate giảm 10× (từ 1e-3 xuống 1e-4) để tránh catastrophic forgetting — backbone chỉ "tinh chỉnh nhẹ", không bị overwrite hoàn toàn.
+- Sau phase này, toàn bộ network tối ưu cho task cụ thể.
+
+**Tóm lại:**
+
+| | Phase 1 | Phase 2 |
+|---|---|---|
+| Backbone | Đóng băng | Mở đóng băng |
+| Mục tiêu | Hội tụ head nhanh | Fine-tune toàn mạng |
+| Learning rate | 1e-3 (lớn) | 1e-4 (nhỏ 10×) |
+| Epoch | 1–15 | 16–25 |
+| Nguy cơ | Head chưa học đủ | Forgetting nếu LR quá cao |
+
+---
+
+### Q4: Tại sao chọn 25 epoch? Không phải 10 hay 100?
+
+**Căn cứ chọn 25 epoch dựa trên 3 yếu tố:**
+
+**1. Quy mô dataset:**
+Dataset có 10.800 ảnh, chia 80/20 → 8.640 ảnh train, 2.160 ảnh val. Với 1 epoch = 1 lần duyệt qua toàn bộ 8.640 ảnh, model cần đủ số epoch để hội tụ nhưng không overfit. Dataset càng nhỏ thì converge càng nhanh.
+
+**2. Phân bổ theo phase:**
+- Phase 1 cần ~10–15 epoch để classification head hội tụ từ random initialization đến giá trị hữu ích.
+- Phase 2 chỉ cần ~8–10 epoch vì backbone đã tốt — chỉ fine-tune nhẹ.
+- Tổng: 15 + 10 = 25 epoch là điểm cân bằng thực nghiệm phổ biến cho transfer learning.
+
+**3. Dấu hiệu overfitting:**
+- Nếu val\_accuracy dừng tăng trong khi train\_accuracy vẫn tăng → model bắt đầu overfit.
+- Với MobileNetV2 và dataset ~10k ảnh, điều này thường xảy ra sau epoch 25–30.
+- Script dùng `EarlyStopping` ngầm: lưu checkpoint của epoch có val\_acc cao nhất → nếu epoch 20 tốt hơn epoch 25, checkpoint của epoch 20 được giữ lại.
+
+**4. Thực tế tính toán:**
+- 25 epoch × ~8.640 ảnh / batch 32 ≈ 6.750 iteration
+- Trên CPU Apple M-series: ~30 phút — chấp nhận được trong môi trường laptop sinh viên
+- Nếu chọn 100 epoch: ~2 giờ CPU mà không chắc cải thiện thêm (có thể còn overfit hơn)
+
+**Kết luận:** 25 epoch là con số kinh nghiệm phổ biến trong cộng đồng Transfer Learning cho dataset cỡ 10k với MobileNet. Nếu val\_acc đã plateau sớm hơn (ví dụ epoch 18), checkpoint tốt nhất vẫn được lưu — số epoch thực tế hữu ích có thể ít hơn.
+
+---
+
+### Q5: FFT dùng để làm gì trong hệ thống này? Không dùng được không?
+
+**FFT trong hệ thống đóng vai trò tiền xử lý, không phải nhận diện chính:**
+
+**High-pass FFT (dùng cho vùng periocular):**
+Khi đeo khẩu trang, chỉ còn vùng mắt để nhận diện. Vùng này nhỏ → phải resize lên để FaceNet xử lý → quá trình resize làm mờ ảnh → mất detail lông mày, vân mắt. FFT high-pass lọc bỏ tần số thấp (thành phần màu nền), giữ lại tần số cao (cạnh, texture) → ảnh periocular sắc nét hơn sau resize.
+
+```
+FFT → dịch DC về tâm → đặt vùng tần số thấp = 0 → IFFT → ảnh chỉ còn cạnh
+```
+
+**Low-pass FFT (tùy chọn cho dataset):**
+Lọc nhiễu JPEG trong ảnh training dataset — các ảnh tải từ internet thường có artifact JPEG ở tần số cao. Low-pass loại bỏ artifact này.
+
+**Nếu không dùng FFT:**
+Hệ thống vẫn chạy được — fallback về dùng ảnh gốc cho FaceNet. Độ chính xác nhận diện khi đeo mask có thể giảm ~2–5% với ảnh chụp điều kiện kém. FFT là bước nâng cao chất lượng, không phải thành phần bắt buộc.
+
+---
+
+### Q6: CLAHE khác Histogram Equalization thông thường ở điểm nào?
+
+**Histogram Equalization (HE) thông thường:**
+- Tính histogram toàn ảnh → map lại intensity để phân bố đều.
+- **Nhược điểm:** Khi ảnh có vùng rất sáng và rất tối, HE khuếch đại nhiễu ở vùng tối và làm mất chi tiết vùng sáng (overexposure).
+
+**CLAHE — Contrast Limited Adaptive HE:**
+- Chia ảnh thành lưới ô nhỏ (ví dụ 8×8 tile).
+- Cân bằng histogram **cục bộ** trong từng ô → phục hồi chi tiết vùng tối mà không ảnh hưởng vùng sáng.
+- **Clip limit:** giới hạn độ dốc histogram tối đa → ngăn khuếch đại nhiễu quá mức.
+
+**Tại sao CLAHE quan trọng với bài toán này:**
+Khuôn mặt trong ánh sáng văn phòng thường có vùng trán sáng (đèn từ trên) và vùng mắt tối (bóng đổ). HE thông thường sẽ overexpose trán. CLAHE xử lý từng vùng riêng → vùng mắt rõ hơn → embedding FaceNet chất lượng hơn.
+
+---
+
+## 6. Khó khăn và cách xử lý
 
 | Khó khăn | Cách xử lý |
 |---|---|
