@@ -44,10 +44,15 @@ except ImportError:
 
 try:
     import cv2
-    from src.preprocessing.image_utils import is_sharp_enough
     _HAS_CV2 = True
 except ImportError:
     _HAS_CV2 = False
+
+try:
+    from src.preprocessing.image_utils import is_sharp_enough
+    _HAS_PREPROCESS = True
+except Exception:
+    _HAS_PREPROCESS = False
 
 
 # ---------------------------------------------------------------------------
@@ -120,8 +125,8 @@ def filter_blurry_indices(dataset: ImageFolder, threshold: float = 80.0):
     Returns:
         list index của ảnh đủ sắc nét
     """
-    if not _HAS_CV2:
-        print('[warn] OpenCV không có sẵn — bỏ qua bước lọc ảnh mờ')
+    if not _HAS_CV2 or not _HAS_PREPROCESS:
+        print('[warn] OpenCV / preprocessing utils không có sẵn — bỏ qua bước lọc ảnh mờ')
         return list(range(len(dataset)))
 
     sharp_indices = []

@@ -27,6 +27,7 @@ data/raw_samples/
 data/raw_full/
 data/processed/
 data/faces/
+data/kaggle_raw/
 
 # Logs & checkpoints
 runs/
