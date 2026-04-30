@@ -28,6 +28,7 @@ data/raw_full/
 data/processed/
 data/faces/
 data/kaggle_raw/
+data/yolo_cls/
 
 # Logs & checkpoints
 runs/

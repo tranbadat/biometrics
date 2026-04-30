@@ -12,3 +12,7 @@ torchvision
 facenet-pytorch
 scikit-learn
 joblib
+ultralytics
+mediapipe
+insightface
+onnxruntime
