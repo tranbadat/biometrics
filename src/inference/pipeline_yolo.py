@@ -1,9 +1,13 @@
-"""Pipeline 3-stage: MediaPipe (detect) + YOLOv8-cls (mask) + InsightFace (recognize).
+"""Pipeline 2-stage: InsightFace (detect + recognize) + YOLOv8-cls (mask classify).
 
-Khác với pipeline.py (dùng MTCNN + CNN), file này tối ưu cho:
-  - Tốc độ real-time (MediaPipe BlazeFace ~100 FPS CPU)
-  - Robust với loá sáng (BlazeFace pretrained trên data đa dạng)
-  - Recognition khi đeo mask (ArcFace buffalo_l robust với occlusion)
+Khác với pipeline.py (dùng MTCNN + CNN custom):
+  - InsightFace `buffalo_l` lo cả detect (RetinaFace) lẫn embedding (ArcFace)
+  - YOLOv8n-cls phân loại mask/no_mask trên crop face
+  - Robust với loá sáng (CLAHE preprocess + augmentation HSV khi train)
+  - Robust với occlusion mask (ArcFace native)
+
+Note: ban đầu thiết kế 3-stage (MediaPipe + YOLO + ArcFace) nhưng MediaPipe 0.10.x
+trên Python 3.14 không export `solutions` API → gộp detect vào InsightFace cho gọn.
 """
 from pathlib import Path
 from typing import Optional
@@ -12,17 +16,13 @@ import cv2
 import numpy as np
 from PIL import Image
 
-# ── Stage 1: MediaPipe face detection ──────────────────────────────────────
+# ── Stage 1+3: InsightFace (detect + ArcFace embedding) ────────────────────
 try:
-    import mediapipe as mp
-    _mp_face = mp.solutions.face_detection.FaceDetection(
-        model_selection=1,        # 1 = full-range (>2m), 0 = short-range (<2m)
-        min_detection_confidence=0.5,
-    )
-    _HAS_MP = True
+    from insightface.app import FaceAnalysis
+    _HAS_INSIGHT = True
 except Exception:
-    _mp_face = None
-    _HAS_MP = False
+    FaceAnalysis = None
+    _HAS_INSIGHT = False
 
 # ── Stage 2: YOLOv8 classification ─────────────────────────────────────────
 try:
@@ -32,23 +32,34 @@ except Exception:
     YOLO = None
     _HAS_YOLO = False
 
-# ── Stage 3: InsightFace ArcFace ───────────────────────────────────────────
-try:
-    from insightface.app import FaceAnalysis
-    _HAS_INSIGHT = True
-except Exception:
-    FaceAnalysis = None
-    _HAS_INSIGHT = False
-
 
 # Đường dẫn weights
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _YOLO_WEIGHTS = _PROJECT_ROOT / "models" / "mask_yolov8n_cls.pt"
+_ARCFACE_DB = _PROJECT_ROOT / "models" / "arcface_db.npz"
 
 # Lazy singletons
 _yolo_model: Optional["YOLO"] = None
 _insight_app: Optional["FaceAnalysis"] = None
 _known_embeddings: dict[str, np.ndarray] = {}  # name -> embedding
+
+
+def _load_db() -> None:
+    """Load ArcFace embeddings DB từ disk (gọi khi import)."""
+    if not _ARCFACE_DB.exists():
+        return
+    data = np.load(_ARCFACE_DB, allow_pickle=False)
+    for key in data.files:
+        _known_embeddings[key] = data[key]
+
+
+def _save_db() -> None:
+    """Persist ArcFace embeddings ra disk."""
+    _ARCFACE_DB.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(_ARCFACE_DB, **_known_embeddings)
+
+
+_load_db()
 
 
 # ── Tiền xử lý chống loá sáng ──────────────────────────────────────────────
@@ -59,28 +70,6 @@ def _apply_clahe(bgr: np.ndarray) -> np.ndarray:
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     l = clahe.apply(l)
     return cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
-
-
-# ── Stage 1: detect ────────────────────────────────────────────────────────
-def _detect_faces_mp(rgb: np.ndarray) -> list[tuple[int, int, int, int, float]]:
-    """Trả về list (x1, y1, x2, y2, score) từ MediaPipe."""
-    if not _HAS_MP:
-        return []
-    h, w = rgb.shape[:2]
-    results = _mp_face.process(rgb)
-    out: list[tuple[int, int, int, int, float]] = []
-    if not results.detections:
-        return out
-    for det in results.detections:
-        bbox = det.location_data.relative_bounding_box
-        x1 = max(0, int(bbox.xmin * w))
-        y1 = max(0, int(bbox.ymin * h))
-        x2 = min(w - 1, int((bbox.xmin + bbox.width) * w))
-        y2 = min(h - 1, int((bbox.ymin + bbox.height) * h))
-        if x2 <= x1 or y2 <= y1:
-            continue
-        out.append((x1, y1, x2, y2, float(det.score[0])))
-    return out
 
 
 # ── Stage 2: classify mask ─────────────────────────────────────────────────
@@ -122,15 +111,10 @@ def _get_insight() -> Optional["FaceAnalysis"]:
     return app
 
 
-def _recognize_identity(face_bgr: np.ndarray, threshold: float = 0.35) -> tuple[Optional[str], float]:
-    """Tính embedding ArcFace, so cosine với DB."""
-    app = _get_insight()
-    if app is None or not _known_embeddings:
+def _match_embedding(emb: np.ndarray, threshold: float = 0.35) -> tuple[Optional[str], float]:
+    """So cosine embedding với DB. Trả về (name, similarity) hoặc (None, best_sim)."""
+    if not _known_embeddings:
         return None, 0.0
-    faces = app.get(face_bgr)
-    if not faces:
-        return None, 0.0
-    emb = faces[0].normed_embedding  # đã L2-normalize
     best_name, best_sim = None, -1.0
     for name, ref in _known_embeddings.items():
         sim = float(np.dot(emb, ref))
@@ -141,37 +125,65 @@ def _recognize_identity(face_bgr: np.ndarray, threshold: float = 0.35) -> tuple[
     return best_name, best_sim
 
 
-def enroll_identity(name: str, face_bgr: np.ndarray) -> bool:
-    """Đăng ký embedding cho 1 người (gọi ngoài pipeline)."""
+def enroll_identity(name: str, face_bgr: np.ndarray, persist: bool = True) -> bool:
+    """Đăng ký embedding cho 1 người. Nếu nhiều ảnh cho cùng `name` thì
+    embedding được trung bình hoá rồi L2-normalize lại.
+    """
     app = _get_insight()
     if app is None:
         return False
     faces = app.get(face_bgr)
     if not faces:
         return False
-    _known_embeddings[name] = faces[0].normed_embedding
+    new_emb = faces[0].normed_embedding
+    if name in _known_embeddings:
+        merged = _known_embeddings[name] + new_emb
+        norm = np.linalg.norm(merged)
+        if norm > 0:
+            merged = merged / norm
+        _known_embeddings[name] = merged
+    else:
+        _known_embeddings[name] = new_emb
+    if persist:
+        _save_db()
     return True
+
+
+def list_identities() -> list[str]:
+    return list(_known_embeddings.keys())
 
 
 # ── Pipeline chính ─────────────────────────────────────────────────────────
 def infer_pil(img: Image.Image) -> list[dict]:
-    """Detect + classify mask + recognize identity. Trả về list dict cho mỗi mặt."""
+    """InsightFace detect → YOLO mask classify → cosine match identity."""
     rgb = np.array(img.convert("RGB"))
     bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
     bgr = _apply_clahe(bgr)
-    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
-    detections = _detect_faces_mp(rgb)
+    app = _get_insight()
     preds: list[dict] = []
-    for x1, y1, x2, y2, score in detections:
+    if app is None:
+        return preds
+
+    faces = app.get(bgr)
+    h, w = bgr.shape[:2]
+    for face in faces:
+        x1, y1, x2, y2 = (int(v) for v in face.bbox)
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w - 1, x2), min(h - 1, y2)
+        if x2 <= x1 or y2 <= y1:
+            continue
+
         face_bgr = bgr[y1:y2, x1:x2]
         if face_bgr.size == 0:
             continue
+
         label, conf = _classify_mask(face_bgr)
-        identity, id_conf = _recognize_identity(face_bgr)
+        identity, id_conf = _match_embedding(face.normed_embedding)
+
         preds.append({
             "box": [x1, y1, x2, y2],
-            "detection_score": score,
+            "detection_score": float(face.det_score),
             "label": label,
             "confidence": conf,
             "identity": identity,

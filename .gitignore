@@ -21,6 +21,8 @@ models/*.pt
 models/*.joblib
 models/*.pkl
 models/*.h5
+models/*.npz
+models/*.onnx
 
 # Dataset (tải riêng, không commit)
 data/raw_samples/

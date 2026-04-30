@@ -1,23 +1,34 @@
+"""FastAPI backend — pipeline MediaPipe + YOLOv8-cls + InsightFace ArcFace.
+
+Switched từ pipeline cũ (MTCNN + CNN + FaceNet/SVM) ngày 2026-04-30.
+Xem docs/pipeline-comparison.md để biết lý do chuyển đổi.
+"""
 from pathlib import Path
 from typing import List
 
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+import cv2
+import io
+import numpy as np
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
-import io
 
-from src.inference import pipeline
+from src.inference import pipeline_yolo as pipeline
 
-app = FastAPI(title="Face+Mask Recognition API")
+app = FastAPI(title="Face+Mask Recognition API (YOLO pipeline)")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
+    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
 )
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "pipeline": "mediapipe+yolov8-cls+arcface",
+        "enrolled": pipeline.list_identities(),
+    }
 
 
 @app.post("/predict")
@@ -34,76 +45,58 @@ async def enroll_face(
     user_id: str = Form(..., description="Mã người dùng — dùng làm tên thư mục"),
     files: List[UploadFile] = File(..., description="Danh sách ảnh khuôn mặt"),
 ):
-    """Đăng ký khuôn mặt mới vào hệ thống.
+    """Đăng ký khuôn mặt mới — dùng InsightFace ArcFace embedding.
 
     - Lưu ảnh vào data/faces/{user_id}/
-    - Chạy FaceNet embedding + retrain SVM
+    - Tính embedding ArcFace cho mỗi ảnh, trung bình hoá, lưu vào models/arcface_db.npz
     """
     if not name.strip():
         raise HTTPException(400, "name không được để trống")
     if not user_id.strip():
         raise HTTPException(400, "user_id không được để trống")
-    if len(files) == 0:
+    if not files:
         raise HTTPException(400, "Cần ít nhất 1 ảnh")
 
-    # Lưu ảnh vào disk
     save_dir = Path("data/faces") / user_id
     save_dir.mkdir(parents=True, exist_ok=True)
 
-    saved_paths = []
+    saved = 0
+    enrolled = 0
+    failures: list[str] = []
+
     for i, f in enumerate(files):
         data = await f.read()
         if not data:
             continue
         path = save_dir / f"frame_{i:04d}.jpg"
         path.write_bytes(data)
-        saved_paths.append(str(path))
+        saved += 1
 
-    if not saved_paths:
-        raise HTTPException(400, "Không lưu được ảnh nào")
+        # Decode ảnh → BGR cho InsightFace
+        arr = np.frombuffer(data, np.uint8)
+        bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if bgr is None:
+            failures.append(f"frame_{i:04d}: decode failed")
+            continue
 
-    # Chạy enroll pipeline
-    enroll_result = {"saved": len(saved_paths), "name": name, "user_id": user_id}
-    try:
-        import sys
-        sys.path.insert(0, ".")
-        from scripts.enroll import (
-            load_database, get_mtcnn, get_facenet,
-            action_enroll, retrain_svm, save_database
-        )
-        import torch
+        ok = pipeline.enroll_identity(user_id, bgr, persist=False)
+        if ok:
+            enrolled += 1
+        else:
+            failures.append(f"frame_{i:04d}: no face detected")
 
-        device = (
-            "cuda" if torch.cuda.is_available()
-            else "mps" if torch.backends.mps.is_available()
-            else "cpu"
-        )
-        model_path = "models/recognizer.joblib"
-        data       = load_database(model_path)
-        mtcnn      = get_mtcnn()
-        facenet    = get_facenet(device)
+    if enrolled == 0:
+        raise HTTPException(400, f"Không trích xuất được embedding nào. Failures: {failures}")
 
-        data = action_enroll(data, name, str(save_dir), mtcnn, facenet, device)
+    # Persist 1 lần sau khi merge xong tất cả ảnh
+    pipeline._save_db()
 
-        if len(set(data["labels"])) >= 2:
-            data["clf"], data["le"] = retrain_svm(data["embeddings"], data["labels"])
-            data["class_names"]     = data["le"].classes_.tolist()
-
-        save_database(data, model_path)
-
-        # Reload recognizer trong pipeline
-        pipeline._RECOG = None
-
-        enroll_result["status"]  = "ok"
-        enroll_result["persons"] = list(set(data["labels"]))
-
-    except Exception as e:
-        # Ảnh vẫn đã được lưu — chỉ bước embedding/SVM thất bại
-        enroll_result["status"]  = "saved_only"
-        enroll_result["warning"] = str(e)
-        enroll_result["hint"]    = (
-            "Ảnh đã lưu thành công. Chạy thủ công: "
-            f"python scripts/enroll.py --name '{name}' --images data/faces/{user_id}/"
-        )
-
-    return enroll_result
+    return {
+        "status": "ok",
+        "name": name,
+        "user_id": user_id,
+        "saved": saved,
+        "enrolled": enrolled,
+        "failures": failures,
+        "total_identities": len(pipeline.list_identities()),
+    }
