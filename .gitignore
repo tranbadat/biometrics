@@ -31,6 +31,7 @@ data/processed/
 data/faces/
 data/kaggle_raw/
 data/yolo_cls/
+data/mfr2/
 
 # Logs & checkpoints
 runs/
