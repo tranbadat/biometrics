@@ -94,7 +94,14 @@ def _classify_mask(face_bgr: np.ndarray) -> tuple[str, float]:
     results = model.predict(face_bgr, imgsz=224, verbose=False)
     probs = results[0].probs
     idx = int(probs.top1)
-    label = model.names[idx]
+    raw = str(model.names[idx]).lower()
+    # Chuẩn hoá tên class về snake_case để khớp _MASK_LABELS
+    if "without" in raw or "no_mask" in raw or raw == "no":
+        label = "without_mask"
+    elif "mask" in raw or "with" in raw:
+        label = "with_mask"
+    else:
+        label = raw
     return label, float(probs.top1conf)
 
 
@@ -111,23 +118,58 @@ def _get_insight() -> Optional["FaceAnalysis"]:
     return app
 
 
-def _match_embedding(emb: np.ndarray, threshold: float = 0.35) -> tuple[Optional[str], float]:
-    """So cosine embedding với DB. Trả về (name, similarity) hoặc (None, best_sim)."""
+_MASK_LABELS = ("with_mask", "without_mask")
+
+
+def _slot_key(name: str, mask_label: str) -> str:
+    return f"{name}__{mask_label}"
+
+
+def _split_key(key: str) -> tuple[str, Optional[str]]:
+    if "__" in key:
+        base, suffix = key.rsplit("__", 1)
+        if suffix in _MASK_LABELS:
+            return base, suffix
+    return key, None
+
+
+def _match_embedding(
+    emb: np.ndarray,
+    mask_label: Optional[str] = None,
+    threshold: float = 0.35,
+) -> tuple[Optional[str], float]:
+    """So cosine với DB, ưu tiên slot cùng trạng thái mask.
+
+    - Nếu có slot khớp `mask_label` → chỉ match trong slot đó (cụm chặt hơn).
+    - Nếu không có slot khớp (user chỉ enroll 1 trạng thái) → fallback toàn DB.
+    """
     if not _known_embeddings:
         return None, 0.0
-    best_name, best_sim = None, -1.0
-    for name, ref in _known_embeddings.items():
+
+    if mask_label in _MASK_LABELS:
+        candidates = {k: v for k, v in _known_embeddings.items() if k.endswith(f"__{mask_label}")}
+        if not candidates:
+            candidates = _known_embeddings
+    else:
+        candidates = _known_embeddings
+
+    best_key, best_sim = None, -1.0
+    for key, ref in candidates.items():
         sim = float(np.dot(emb, ref))
         if sim > best_sim:
-            best_name, best_sim = name, sim
-    if best_sim < threshold:
+            best_key, best_sim = key, sim
+
+    if best_sim < threshold or best_key is None:
         return None, best_sim
-    return best_name, best_sim
+    base_name, _ = _split_key(best_key)
+    return base_name, best_sim
 
 
 def enroll_identity(name: str, face_bgr: np.ndarray, persist: bool = True) -> bool:
-    """Đăng ký embedding cho 1 người. Nếu nhiều ảnh cho cùng `name` thì
-    embedding được trung bình hoá rồi L2-normalize lại.
+    """Đăng ký embedding cho 1 người, tách slot theo trạng thái mask.
+
+    Pipeline: detect → crop face → classify mask → lưu vào slot `name__<mask_label>`.
+    Nhiều ảnh cùng (name, mask_label) sẽ được trung bình + L2-normalize.
     """
     app = _get_insight()
     if app is None:
@@ -135,22 +177,57 @@ def enroll_identity(name: str, face_bgr: np.ndarray, persist: bool = True) -> bo
     faces = app.get(face_bgr)
     if not faces:
         return False
-    new_emb = faces[0].normed_embedding
-    if name in _known_embeddings:
-        merged = _known_embeddings[name] + new_emb
+
+    face = faces[0]
+    x1, y1, x2, y2 = (int(v) for v in face.bbox)
+    h, w = face_bgr.shape[:2]
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(w - 1, x2), min(h - 1, y2)
+    if x2 <= x1 or y2 <= y1:
+        return False
+
+    face_h = y2 - y1
+    face_w = x2 - x1
+    ex1 = max(0, x1 - int(face_w * 0.10))
+    ex2 = min(w - 1, x2 + int(face_w * 0.10))
+    ey1 = max(0, y1 - int(face_h * 0.10))
+    ey2 = min(h - 1, y2 + int(face_h * 0.25))
+    crop = face_bgr[ey1:ey2, ex1:ex2]
+    if crop.size == 0:
+        crop = face_bgr[y1:y2, x1:x2]
+    mask_label, _ = _classify_mask(crop)
+    if mask_label not in _MASK_LABELS:
+        mask_label = "without_mask"
+
+    key = _slot_key(name, mask_label)
+    new_emb = face.normed_embedding
+    if key in _known_embeddings:
+        merged = _known_embeddings[key] + new_emb
         norm = np.linalg.norm(merged)
         if norm > 0:
             merged = merged / norm
-        _known_embeddings[name] = merged
+        _known_embeddings[key] = merged
     else:
-        _known_embeddings[name] = new_emb
+        _known_embeddings[key] = new_emb
+
     if persist:
         _save_db()
     return True
 
 
 def list_identities() -> list[str]:
-    return list(_known_embeddings.keys())
+    """Trả về danh sách tên người (đã gộp 2 slot mask/no_mask)."""
+    names = {_split_key(k)[0] for k in _known_embeddings.keys()}
+    return sorted(names)
+
+
+def list_slots() -> dict[str, list[str]]:
+    """Debug: trả về dict {name: [trạng thái đã enroll]}."""
+    out: dict[str, list[str]] = {}
+    for k in _known_embeddings.keys():
+        base, suffix = _split_key(k)
+        out.setdefault(base, []).append(suffix or "legacy")
+    return out
 
 
 # ── Pipeline chính ─────────────────────────────────────────────────────────
@@ -178,8 +255,19 @@ def infer_pil(img: Image.Image) -> list[dict]:
         if face_bgr.size == 0:
             continue
 
-        label, conf = _classify_mask(face_bgr)
-        identity, id_conf = _match_embedding(face.normed_embedding)
+        # Mở rộng bbox xuống dưới + ngang để YOLO thấy đủ vùng khẩu trang
+        face_h = y2 - y1
+        face_w = x2 - x1
+        ex1 = max(0, x1 - int(face_w * 0.10))
+        ex2 = min(w - 1, x2 + int(face_w * 0.10))
+        ey1 = max(0, y1 - int(face_h * 0.10))
+        ey2 = min(h - 1, y2 + int(face_h * 0.25))
+        face_for_mask = bgr[ey1:ey2, ex1:ex2]
+        if face_for_mask.size == 0:
+            face_for_mask = face_bgr
+
+        label, conf = _classify_mask(face_for_mask)
+        identity, id_conf = _match_embedding(face.normed_embedding, mask_label=label)
 
         preds.append({
             "box": [x1, y1, x2, y2],
