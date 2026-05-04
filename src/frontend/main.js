@@ -323,7 +323,7 @@ function drawBoxes(ctx, preds, imgW, imgH) {
     const sx = x1 * scaleX, sy = y1 * scaleY;
     const sw = (x2 - x1) * scaleX, sh = (y2 - y1) * scaleY;
 
-    const color = p.label === 'mask' ? '#22c55e' : '#ef4444';
+    const color = p.label === 'with_mask' ? '#22c55e' : '#ef4444';
     ctx.strokeStyle = color;
     ctx.lineWidth = 2.5;
     ctx.strokeRect(sx, sy, sw, sh);
@@ -340,8 +340,9 @@ function drawBoxes(ctx, preds, imgW, imgH) {
     });
 
     // Label pill
-    const maskTxt = p.label === 'mask' ? '😷 Đeo khẩu trang' : '😶 Không đeo';
-    const idTxt   = p.identity ? `  |  👤 ${p.identity}` : '';
+    const maskTxt = p.label === 'with_mask' ? '😷 Đeo khẩu trang' : '😶 Không đeo';
+    const idLabel = p.identity_name ? `${p.identity_name} (${p.identity})` : p.identity;
+    const idTxt   = p.identity ? `  |  👤 ${idLabel}` : '';
     const label   = maskTxt + idTxt;
     ctx.lineWidth = 1;
     const tw = ctx.measureText(label).width;
@@ -387,11 +388,12 @@ function showRecogResult(preds, imgW, imgH) {
   // Lấy prediction đầu tiên (hoặc confidence cao nhất)
   const p = preds.slice().sort((a,b) => b.confidence - a.confidence)[0];
 
-  document.getElementById('res-identity').textContent = p.identity || 'Chưa nhận ra';
-  document.getElementById('res-uid').textContent = p.identity ? `(đã enroll)` : '—';
+  document.getElementById('res-identity').textContent =
+    p.identity_name || p.identity || 'Chưa nhận ra';
+  document.getElementById('res-uid').textContent = p.identity ? `Mã: ${p.identity}` : '—';
   document.getElementById('res-face-count').textContent = `${preds.length} khuôn mặt`;
 
-  const maskTxt = p.label === 'mask' ? '😷 Đeo khẩu trang' : '😶 Không đeo khẩu trang';
+  const maskTxt = p.label === 'with_mask' ? '😷 Đeo khẩu trang' : '😶 Không đeo khẩu trang';
   document.getElementById('res-mask').textContent = maskTxt;
 
   const maskPct = (p.confidence * 100).toFixed(1) + '%';
@@ -406,8 +408,8 @@ function showRecogResult(preds, imgW, imgH) {
     : '—';
 
   const badgesEl = document.getElementById('res-badges');
-  const maskCls  = p.label === 'mask' ? 'badge-mask' : 'badge-nomask';
-  const maskBadge = `<span class="${maskCls}">${p.label === 'mask' ? 'CÓ KHẨU TRANG' : 'KHÔNG KHẨU TRANG'}</span>`;
+  const maskCls  = p.label === 'with_mask' ? 'badge-mask' : 'badge-nomask';
+  const maskBadge = `<span class="${maskCls}">${p.label === 'with_mask' ? 'CÓ KHẨU TRANG' : 'KHÔNG KHẨU TRANG'}</span>`;
   const idBadge   = p.identity
     ? `<span class="badge-mask" style="margin-left:6px">NHẬN RA</span>`
     : `<span class="badge-unknown" style="margin-left:6px">CHƯA ENROLL</span>`;
@@ -466,9 +468,10 @@ function renderLogs() {
         <div class="log-time">${dateStr} ${timeStr}</div>`;
     } else {
       const facesHtml = log.preds.map(p => {
-        const maskCls  = p.label === 'mask' ? 'badge-mask' : 'badge-nomask';
-        const maskText = p.label === 'mask' ? '😷 Đeo khẩu trang' : '😶 Không đeo';
-        const idText   = p.identity ? `👤 ${p.identity}` : '👤 Chưa nhận ra';
+        const maskCls  = p.label === 'with_mask' ? 'badge-mask' : 'badge-nomask';
+        const maskText = p.label === 'with_mask' ? '😷 Đeo khẩu trang' : '😶 Không đeo';
+        const idLabel  = p.identity_name ? `${p.identity_name} (${p.identity})` : p.identity;
+        const idText   = p.identity ? `👤 ${idLabel}` : '👤 Chưa nhận ra';
         const confMask = (p.confidence * 100).toFixed(0) + '%';
         const confId   = p.identity_confidence > 0 ? (p.identity_confidence * 100).toFixed(0) + '%' : '';
         return `<div style="margin-bottom:6px">

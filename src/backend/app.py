@@ -36,6 +36,11 @@ async def predict(file: UploadFile = File(...)):
     contents = await file.read()
     img = Image.open(io.BytesIO(contents)).convert("RGB")
     results = pipeline.infer_pil(img)
+    print(f"[predict] {len(results)} face(s):")
+    for i, r in enumerate(results):
+        print(f"  #{i}: label={r['label']} ({r['confidence']:.2f}) "
+              f"identity={r['identity']} ({r['identity_confidence']:.2f}) "
+              f"box={r['box']}")
     return {"predictions": results}
 
 
@@ -79,7 +84,7 @@ async def enroll_face(
             failures.append(f"frame_{i:04d}: decode failed")
             continue
 
-        ok = pipeline.enroll_identity(user_id, bgr, persist=False)
+        ok = pipeline.enroll_identity(user_id, bgr, persist=False, display_name=name)
         if ok:
             enrolled += 1
         else:

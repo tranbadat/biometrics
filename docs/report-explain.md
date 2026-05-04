@@ -227,6 +227,170 @@ Nếu user mới enroll chỉ với 1 trạng thái (ví dụ chỉ ảnh không
 
 ---
 
+## 4b. Tổ chức lưu dữ liệu & cơ chế mapping user ↔ khuôn mặt
+
+> Phần này giải thích cách hệ thống lưu trữ dữ liệu sinh trắc và **liên kết một bộ embedding với thông tin định danh** (mã người dùng + họ tên) — câu hỏi phản biện rất hay gặp.
+
+### 4b.1 Sơ đồ tổ chức dữ liệu
+
+```
+2D-Regonization-Mask/
+├── data/
+│   └── faces/                          ← ảnh thô enroll (raw images)
+│       ├── NV20261/
+│       │   ├── frame_0000.jpg
+│       │   ├── frame_0001.jpg
+│       │   └── frame_0002.jpg
+│       ├── NV20262/
+│       │   └── ...
+│       └── ...
+└── models/
+    ├── arcface_db.npz                  ← bảng embedding 512-D (binary)
+    │     keys = "{user_id}__{mask_label}"
+    │     values = np.ndarray shape (512,) float32, đã L2-normalize
+    │
+    └── arcface_names.json              ← bảng tên hiển thị (sidecar JSON)
+          {
+            "NV20261": "Nguyễn Văn A",
+            "NV20262": "Trần Thị B"
+          }
+```
+
+### 4b.2 Ba lớp dữ liệu — vai trò khác nhau
+
+| Lớp | File | Định dạng | Có thể tái tạo? | Vai trò |
+|---|---|---|---|---|
+| **Raw images** | `data/faces/{user_id}/*.jpg` | JPEG | Không (gốc) | Backup để re-enroll, debug; **có thể xoá để bảo vệ privacy** |
+| **Embeddings** | `models/arcface_db.npz` | NumPy `.npz` (binary) | Có (re-enroll từ raw) | Dữ liệu thực sự dùng cho inference; vector 512-D không thể reconstruct ảnh |
+| **Display names** | `models/arcface_names.json` | JSON UTF-8 | Không (gốc) | Mapping `user_id → họ tên` để hiển thị friendly |
+
+**Nguyên tắc tách lớp**:
+- Embedding là "xương sống" — đủ để nhận diện, không lộ thông tin gốc.
+- Tên hiển thị là metadata phụ — có thể chỉnh tay (sửa file JSON), không ảnh hưởng pipeline.
+- Ảnh thô là layer dùng để debug/re-enroll khi cần — nên xoá sau khi enroll xong nếu sản phẩm production.
+
+### 4b.3 Cơ chế mapping: 3 cấp khoá
+
+```
+┌──────────────────────────────────────────────────┐
+│  display_name      "Nguyễn Văn A"                 │  ← cấp UX
+│       │                                           │
+│       │  arcface_names.json                       │
+│       ▼                                           │
+│  user_id           "NV20261"                      │  ← cấp định danh
+│       │                                           │
+│       │  + mask_label                             │
+│       ▼                                           │
+│  slot_key          "NV20261__with_mask"           │  ← cấp lưu trữ
+│       │                                           │
+│       │  arcface_db.npz                           │
+│       ▼                                           │
+│  embedding         np.float32 [512]               │  ← cấp sinh trắc
+└──────────────────────────────────────────────────┘
+```
+
+**Tại sao 3 cấp thay vì 1 cấp?**
+- **Tách `display_name` khỏi `user_id`**: nếu lưu thẳng "Nguyễn Văn A" làm key, hệ thống vỡ khi: (i) trùng tên, (ii) tên có dấu/khoảng trắng/Unicode không an toàn cho key. `user_id` (`NV20261`) là **business key** ổn định, ASCII-safe, không trùng.
+- **Tách `slot_key` khỏi `user_id`**: cần mặt thái mask để routing dual-slot (xem mục 4). Composite key `{user_id}__{mask_label}` là cấu trúc nội bộ của DB.
+- **Tách `embedding` khỏi key**: embedding là dữ liệu sinh trắc, lưu binary trong npz để compact và load nhanh; key là string nằm ở metadata.
+
+### 4b.4 Quy trình enroll — cập nhật cả 3 lớp
+
+```python
+# Backend nhận: name="Nguyễn Văn A", user_id="NV20261", files=[ảnh1, ảnh2, ...]
+
+# 1. Lưu raw images (lớp 1)
+for i, file in enumerate(files):
+    save_dir = Path("data/faces") / user_id
+    save_dir.mkdir(parents=True, exist_ok=True)
+    (save_dir / f"frame_{i:04d}.jpg").write_bytes(file_bytes)
+
+# 2. Tạo embedding + xác định slot (lớp 2)
+for bgr in decoded_images:
+    pipeline.enroll_identity(
+        name=user_id,             # business key
+        face_bgr=bgr,
+        display_name=name,        # họ tên hiển thị
+        persist=False,
+    )
+    # → bên trong:
+    #     mask_label = YOLO(crop)
+    #     slot_key   = f"{user_id}__{mask_label}"
+    #     _known_embeddings[slot_key] = avg_normalized_embedding
+    #     _known_names[user_id]       = display_name
+
+# 3. Persist cả 2 file 1 lần
+pipeline._save_db()
+# → arcface_db.npz   (embeddings)
+# → arcface_names.json (names)
+```
+
+### 4b.5 Quy trình inference — đi ngược 3 cấp
+
+```python
+# 1. Lớp sinh trắc → lớp định danh
+emb        = arcface(bgr)          # vector 512-D
+mask_label = yolo(crop)            # "with_mask" / "without_mask"
+best_slot  = argmax_cosine(emb, db, filter=f"__{mask_label}")
+# best_slot = "NV20261__with_mask"
+
+# 2. Lớp định danh → lớp UX
+user_id      = best_slot.split("__")[0]            # "NV20261"
+display_name = _known_names.get(user_id)           # "Nguyễn Văn A"
+
+# 3. Trả về client
+return {
+    "identity":      "NV20261",
+    "identity_name": "Nguyễn Văn A",
+    "label":         "with_mask",
+    "confidence":    1.00,
+    "identity_confidence": 0.52,
+    "box":           [x1, y1, x2, y2],
+}
+```
+
+### 4b.6 Vì sao dùng JSON sidecar thay vì nhồi tên vào npz?
+
+| Phương án | Ưu | Nhược |
+|---|---|---|
+| **Nhồi tên vào npz** (vd metadata key `_name_NV20261`) | 1 file duy nhất | npz chỉ lưu numpy arrays; nhồi string phải allow_pickle → **rủi ro bảo mật** (load arbitrary code), khó đọc thủ công |
+| **Sidecar JSON** (đang dùng) | An toàn (`allow_pickle=False`); người vận hành mở file JSON sửa tên dễ | Có 2 file cần đồng bộ |
+| **SQLite** | Truy vấn linh hoạt | Quá nặng cho ~vài chục user |
+
+→ JSON sidecar là **trade-off đúng quy mô đề tài**.
+
+### 4b.7 Tính chất của embedding (giải thích cho hội đồng)
+
+- **Kích thước cố định**: mỗi user = 1 vector 512-D × 2 slot = ~4 KB → DB 100 user ≤ **400 KB** (rất nhẹ).
+- **Không reversible**: từ embedding **không thể tái tạo lại ảnh khuôn mặt gốc** — đây là tính chất one-way của deep feature, đảm bảo privacy ở mức cơ bản.
+- **L2-normalized**: mọi vector nằm trên mặt cầu đơn vị 512-D → so sánh bằng cosine similarity = dot product (rất nhanh).
+- **Stable across sessions**: cùng 1 ảnh, ArcFace luôn cho ra cùng embedding → enroll 1 lần dùng nhiều lần.
+
+### 4b.8 Quản trị: thêm / xoá / sửa user
+
+| Thao tác | Cần làm gì |
+|---|---|
+| **Thêm user mới** | POST `/enroll` với `name` + `user_id` + ảnh → cả 3 lớp tự cập nhật |
+| **Sửa họ tên** | Mở `models/arcface_names.json`, sửa value → restart server |
+| **Xoá 1 user** | (i) xoá `data/faces/{user_id}/`, (ii) xoá các key `{user_id}__*` trong npz, (iii) xoá entry trong JSON |
+| **Reset toàn bộ** | `rm models/arcface_db.npz models/arcface_names.json && rm -rf data/faces/` |
+| **Audit** | `python -c "import json; print(json.load(open('models/arcface_names.json')))"` để xem ai đã enroll |
+
+### 4b.9 Ưu / nhược điểm thiết kế lưu trữ này
+
+**Ưu điểm**
+- Tách lớp rõ ràng → **xoá ảnh thô không phá DB**, đảm bảo privacy ngay khi cần.
+- File phẳng (npz + json) → **dễ backup, dễ migrate**, không cần daemon DB.
+- Composite key `{user_id}__{mask_label}` → **mở rộng tự nhiên** cho dual-slot, có thể thêm trạng thái khác (kính, mũ) mà không đổi schema.
+- Họ tên Unicode (tiếng Việt có dấu) lưu UTF-8 trong JSON → **không vướng encoding**.
+
+**Nhược điểm**
+- 2 file cần đồng bộ (npz + json) → nếu lỗi giữa chừng có thể lệch trạng thái → giảm thiểu bằng `_save_db()` ghi cả 2 trong cùng 1 lượt.
+- Không có versioning → nếu enroll nhầm, không rollback được trừ khi backup tay.
+- Không scale lên hàng triệu user (load toàn bộ vào RAM) → đề tài nhỏ-vừa nên chấp nhận; cần FAISS + SQLite/Postgres cho production lớn.
+
+---
+
 ## 5. Câu hỏi phản biện thường gặp khi bảo vệ
 
 ### 5.1 Về thiết kế dual-slot

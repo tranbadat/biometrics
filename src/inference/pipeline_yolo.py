@@ -34,29 +34,38 @@ except Exception:
 
 
 # Đường dẫn weights
+import json
+
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _YOLO_WEIGHTS = _PROJECT_ROOT / "models" / "mask_yolov8n_cls.pt"
 _ARCFACE_DB = _PROJECT_ROOT / "models" / "arcface_db.npz"
+_NAMES_DB = _PROJECT_ROOT / "models" / "arcface_names.json"
 
 # Lazy singletons
 _yolo_model: Optional["YOLO"] = None
 _insight_app: Optional["FaceAnalysis"] = None
-_known_embeddings: dict[str, np.ndarray] = {}  # name -> embedding
+_known_embeddings: dict[str, np.ndarray] = {}  # "{user_id}__{mask}" -> embedding
+_known_names: dict[str, str] = {}              # user_id -> họ tên
 
 
 def _load_db() -> None:
-    """Load ArcFace embeddings DB từ disk (gọi khi import)."""
-    if not _ARCFACE_DB.exists():
-        return
-    data = np.load(_ARCFACE_DB, allow_pickle=False)
-    for key in data.files:
-        _known_embeddings[key] = data[key]
+    """Load ArcFace embeddings + bảng tên từ disk."""
+    if _ARCFACE_DB.exists():
+        data = np.load(_ARCFACE_DB, allow_pickle=False)
+        for key in data.files:
+            _known_embeddings[key] = data[key]
+    if _NAMES_DB.exists():
+        try:
+            _known_names.update(json.loads(_NAMES_DB.read_text(encoding="utf-8")))
+        except Exception:
+            pass
 
 
 def _save_db() -> None:
-    """Persist ArcFace embeddings ra disk."""
+    """Persist embeddings + bảng tên ra disk."""
     _ARCFACE_DB.parent.mkdir(parents=True, exist_ok=True)
     np.savez(_ARCFACE_DB, **_known_embeddings)
+    _NAMES_DB.write_text(json.dumps(_known_names, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 _load_db()
@@ -165,7 +174,12 @@ def _match_embedding(
     return base_name, best_sim
 
 
-def enroll_identity(name: str, face_bgr: np.ndarray, persist: bool = True) -> bool:
+def enroll_identity(
+    name: str,
+    face_bgr: np.ndarray,
+    persist: bool = True,
+    display_name: Optional[str] = None,
+) -> bool:
     """Đăng ký embedding cho 1 người, tách slot theo trạng thái mask.
 
     Pipeline: detect → crop face → classify mask → lưu vào slot `name__<mask_label>`.
@@ -209,6 +223,9 @@ def enroll_identity(name: str, face_bgr: np.ndarray, persist: bool = True) -> bo
         _known_embeddings[key] = merged
     else:
         _known_embeddings[key] = new_emb
+
+    if display_name:
+        _known_names[name] = display_name
 
     if persist:
         _save_db()
@@ -275,6 +292,7 @@ def infer_pil(img: Image.Image) -> list[dict]:
             "label": label,
             "confidence": conf,
             "identity": identity,
+            "identity_name": _known_names.get(identity) if identity else None,
             "identity_confidence": id_conf,
         })
     return preds
