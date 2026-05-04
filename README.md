@@ -1,472 +1,278 @@
-# Hệ thống Định danh Sinh trắc học — Nhận diện Khuôn mặt có Đeo Khẩu trang
+# Hệ thống Nhận diện Khuôn mặt có Đeo Khẩu trang
 
 > **Đề tài Bài tập lớn — Nhận dạng và Xử lý ảnh / Sinh trắc học**
 >
-> Xây dựng hệ thống nhận diện khuôn mặt có khả năng hoạt động trong điều kiện người dùng **đeo khẩu trang**, kết hợp kỹ thuật xử lý ảnh cổ điển (FFT, lọc tần số, OpenCV) với mô hình học sâu (MTCNN, MobileNetV2, FaceNet).
+> Pipeline 3 stage: **RetinaFace** detect → **YOLOv8n-cls** classify mask → **ArcFace** embedding + **Dual-slot DB** match identity. Kết hợp xử lý ảnh cổ điển (CLAHE, FFT, Sobel) với deep learning.
 
 ---
 
 ## Mục lục
 
-1. [Đặt vấn đề](#1-đặt-vấn-đề)
-2. [Mục tiêu đề tài](#2-mục-tiêu-đề-tài)
-3. [Pipeline tổng thể](#3-pipeline-tổng-thể)
-4. [Kiến thức áp dụng](#4-kiến-thức-áp-dụng)
-5. [Công nghệ và công cụ](#5-công-nghệ-và-công-cụ)
-6. [Kiến trúc hệ thống](#6-kiến-trúc-hệ-thống)
-7. [Giải pháp chi tiết](#7-giải-pháp-chi-tiết)
-8. [Dataset](#8-dataset)
-9. [Cài đặt và chạy thử](#9-cài-đặt-và-chạy-thử)
-10. [Kết quả kỳ vọng](#10-kết-quả-kỳ-vọng)
-11. [Hạn chế và hướng phát triển](#11-hạn-chế-và-hướng-phát-triển)
+1. [Bài toán & mục tiêu](#1-bài-toán--mục-tiêu)
+2. [Kiến trúc pipeline](#2-kiến-trúc-pipeline)
+3. [Mô hình & dữ liệu](#3-mô-hình--dữ-liệu)
+4. [Tổ chức lưu trữ](#4-tổ-chức-lưu-trữ)
+5. [Cài đặt](#5-cài-đặt)
+6. [Cách chạy](#6-cách-chạy)
+7. [Cấu trúc thư mục](#7-cấu-trúc-thư-mục)
+8. [Tài liệu chi tiết](#8-tài-liệu-chi-tiết)
 
 ---
 
-## 1. Đặt vấn đề
+## 1. Bài toán & mục tiêu
 
-Nhận diện khuôn mặt là bài toán sinh trắc học phổ biến được ứng dụng trong kiểm soát ra vào, chấm công, xác thực danh tính. Tuy nhiên, khi người dùng **đeo khẩu trang**, phần dưới khuôn mặt bị che khuất (~60% diện tích), khiến các hệ thống truyền thống sụt giảm độ chính xác nghiêm trọng.
+### Bài toán
+Nhận diện danh tính (1:N identification) qua webcam khi người dùng có thể **đeo khẩu trang** — tình huống ~60% diện tích khuôn mặt bị che. Đồng thời báo cáo **trạng thái mask** (đeo / không đeo).
 
-**Thách thức chính:**
+### Mục tiêu cụ thể
+1. **Detect khuôn mặt** trong ảnh / frame webcam.
+2. **Phân loại mask**: `with_mask` / `without_mask`.
+3. **Định danh** user qua embedding 512-D, hoạt động cho cả 2 trạng thái mask.
+4. **Mask label tham gia recognition**: routing slot DB theo trạng thái — không chỉ là output phụ.
 
-| Vấn đề | Ảnh hưởng |
+---
+
+## 2. Kiến trúc pipeline
+
+```
+Ảnh đầu vào (webcam / upload)
+        │
+        ▼
+   CLAHE kênh L (LAB)            ← chống loá / ngược sáng
+        │
+        ▼
+┌──────────────────────────────┐
+│ InsightFace buffalo_l        │   RetinaFace + ArcFace ResNet-50
+│  - bbox, det_score           │   embedding 512-D L2-normalized
+│  - normed_embedding 512-D    │
+└──────────────┬───────────────┘
+               │
+               ▼  Crop face + expand 10% sides + 25% xuống dưới
+┌──────────────────────────────┐
+│ YOLOv8n-cls (custom-trained) │   2 lớp: with_mask / without_mask
+│ → mask_label                  │   Train trên Face Mask 12k
+└──────────────┬───────────────┘
+               │
+               ▼  mask_label dùng làm điều kiện routing
+┌──────────────────────────────────────────┐
+│ DB arcface_db.npz — DUAL SLOT             │
+│   key  = "{user_id}__{mask_label}"        │
+│   value = embedding 512-D                 │
+│                                            │
+│ Cosine match CHỈ trong slot cùng trạng    │
+│ thái mask. Threshold 0.35.                │
+│ Fallback: nếu slot rỗng → match toàn DB.  │
+└──────────────┬───────────────────────────┘
+               │
+               ▼  Lookup user_id → display_name
+┌──────────────────────────────────────────┐
+│ arcface_names.json                       │
+│   { "NV20261": "Nguyễn Văn A", ... }     │
+└──────────────┬───────────────────────────┘
+               │
+               ▼
+   JSON response: bbox + mask_label + identity (id + tên)
+                  + confidences
+```
+
+### Vì sao tách dual-slot?
+- Embedding ArcFace của cùng 1 người ở 2 trạng thái mask vẫn lệch ~0.4–0.5 cosine.
+- Tách 2 slot độc lập (`alice__with_mask`, `alice__without_mask`) → mỗi cụm chặt → phân biệt giữa người tốt hơn.
+- Mask classifier có vai trò routing thực sự, không chỉ là output phụ.
+
+> Phân tích chi tiết, đánh giá ưu/nhược điểm, so sánh với các phương án khác: xem `docs/report-explain.md` mục 8.
+
+---
+
+## 3. Mô hình & dữ liệu
+
+### Mô hình
+
+| Mô hình | Bước trong flow | Mục đích cụ thể | Input → Output | Trạng thái | Nguồn |
+|---|---|---|---|---|---|
+| **RetinaFace** (`buffalo_l`) | **Stage 1** — ngay sau CLAHE | Phát hiện vị trí khuôn mặt trong ảnh, trả bbox + det_score + 5 landmark | Ảnh BGR → list bbox `[x1,y1,x2,y2]` | Pretrained, dùng nguyên (không fine-tune) | InsightFace, train trên WIDER FACE (32k ảnh) |
+| **ArcFace ResNet-50** (`buffalo_l`) | **Stage 3** — chạy cùng RetinaFace trong 1 forward pass của `app.get()` | Trích xuất **vector đặc trưng 512-D** đại diện danh tính của khuôn mặt; vector này dùng để so cosine với DB | Crop face (ngầm align) → embedding `[512]` đã L2-normalize | Pretrained, dùng nguyên (không fine-tune) | InsightFace, train trên Glint360k (~17M ảnh, ~360k identities) |
+| **YOLOv8n-cls** | **Stage 2** — sau khi crop face từ bbox của RetinaFace | Phân loại trạng thái khẩu trang trên crop face, output dùng làm **routing key** cho dual-slot DB | Crop face BGR → label `with_mask` / `without_mask` + confidence | **Tự train** trên Face Mask 12k | Khởi tạo từ Ultralytics ImageNet weights |
+
+**Ghi chú quan trọng**:
+- RetinaFace và ArcFace nằm chung trong gói `buffalo_l` của InsightFace → khi gọi `app.get(bgr)` **cả 2 chạy cùng lúc**, mỗi face object đã có sẵn `bbox` (từ RetinaFace) và `normed_embedding` (từ ArcFace).
+- YOLOv8n-cls chạy **độc lập, sau** khi RetinaFace đã cho bbox — nhận crop face làm input, không thấy ảnh gốc.
+- Cả 3 mô hình **không train nội bộ về danh tính** — recognition hoạt động ở mức **open-set**: cosine similarity giữa embedding test với embedding đã enroll trong DB. Thêm user mới chỉ cần thêm vector vào `arcface_db.npz`, không retrain.
+
+### Augmentation khi train YOLOv8n-cls (mask classifier)
+
+Để mask classifier robust với điều kiện thực tế (ánh sáng kém, xoay đầu, mask bị che một phần), training áp dụng augmentation **mạnh** trong `scripts/train_yolo_mask.py`:
+
+| Loại augmentation | Tham số | Mô phỏng tình huống |
+|---|---|---|
+| **HSV jitter** | `hsv_h=0.015`, `hsv_s=0.7`, `hsv_v=0.6` | Ánh sáng yếu / chói / đèn vàng / ngược sáng (tăng mạnh value) |
+| **Rotation** | `degrees=10` | Đầu nghiêng ±10° |
+| **Translate** | `translate=0.1` | Mặt lệch tâm khung hình ±10% |
+| **Scale** | `scale=0.3` | Khoảng cách camera khác nhau (zoom in/out 30%) |
+| **Horizontal flip** | `fliplr=0.5` | 50% ảnh được lật ngang (mặt đối xứng nên hợp lệ) |
+| **Random erasing** | `erasing=0.2` | 20% ảnh bị xoá ngẫu nhiên 1 patch — **giả lập occlusion** (tay che, vật thể chắn) |
+| **Dropout** | `dropout=0.1` | Regularization, chống overfit |
+| **Weight decay** | `5e-4` | Regularization L2 |
+| **Early stopping** | `patience=10` | Dừng sớm nếu val loss không giảm 10 epoch |
+
+**Augmentation có sẵn của Ultralytics** (mặc định bật, không cần khai báo):
+- Mosaic augmentation (ghép 4 ảnh thành 1 → tăng đa dạng background).
+- Mixup (trộn 2 ảnh + label → smooth decision boundary).
+- Auto-augment (chuỗi transform tự động).
+
+**Đã KHÔNG dùng**:
+- `degrees > 15°`: xoay quá lớn → mặt lộn ngược không có trong điều kiện thực.
+- `flipud`: lật dọc → mặt ngược chiều, không xảy ra trong webcam.
+- Cutout patch lớn: làm mất hẳn vùng mask → label bị đảo ngược ý nghĩa.
+
+**Kết quả thực nghiệm trên Face Mask 12k**:
+- Validation accuracy: ~99% (sau 30 epoch, early stop ~epoch 20).
+- Test accuracy: ~98%.
+- Robust với loá sáng (HSV-V augment mạnh).
+- Robust với xoay nhẹ (degrees=10).
+
+> Có thể chạy lại training với augmentation khác bằng cách sửa `scripts/train_yolo_mask.py` rồi `python scripts/train_yolo_mask.py`. Output weights tự copy vào `models/mask_yolov8n_cls.pt`.
+
+### Cách ArcFace xử lý ảnh có khẩu trang
+
+**ArcFace LUÔN trích 512-D trên TOÀN BỘ crop face** — kể cả vùng đang đeo khẩu trang. Pipeline **không** segment mask ra trước khi embed; cũng **không** crop riêng vùng mắt (periocular).
+
+```
+Input  : crop face 112×112 (đã align bằng 5 landmark từ RetinaFace)
+         ─ chứa cả vùng mắt + mũi + miệng (hoặc khẩu trang nếu có)
+ArcFace: ResNet-50 → mọi pixel đi qua convolution như nhau
+Output : vector 512-D L2-normalized
+```
+
+**Tại sao vẫn nhận ra được khi đeo mask?**
+1. **Training data đa dạng**: Glint360k chứa ảnh có occlusion (kính, tay che mặt, mask một phần) → mạng đã ngầm học cách **giảm trọng số đặc trưng** từ vùng dễ bị che, **tăng trọng số** từ vùng ổn định (mắt, lông mày, trán, hình dạng đầu).
+2. **Convolution có receptive field rộng**: lớp sâu của ResNet-50 nhìn cả vùng lớn → nếu vùng cằm/miệng bị che, các neuron vẫn rút được đặc trưng từ phần còn lại.
+3. **Loss ArcFace ép cụm chặt**: train với additive angular margin → embedding cùng người (kể cả ở trạng thái khác nhau) bị kéo về gần nhau trên hypersphere, **ngay cả khi 60% mặt bị che**.
+
+**Hệ quả thực tế** (giá trị cosine similarity giữa 2 embedding):
+
+| Trường hợp | Cosine ≈ | Ghi chú |
+|---|---|---|
+| Cùng người, cùng trạng thái mask | **0.65–0.80** | Cụm rất chặt, dễ phân biệt |
+| **Cùng người, khác trạng thái mask** | **0.40–0.50** | **"Drift"** — vẫn vượt threshold 0.35 nên match đúng, nhưng kém chặt |
+| Khác người, cả 2 không mask | 0.10–0.25 | Phân tách rõ |
+| Khác người, cả 2 đeo mask | 0.20–0.35 | Gần threshold → dễ false accept |
+
+**Cách hiểu drift**: tưởng tượng embedding 512-D nằm trên mặt cầu đơn vị. Embedding của Alice "đeo mask" và Alice "không mask" là **2 điểm khác nhau** trên cầu, lệch một góc tương đương cosine ~0.45. Cùng người mà lệch ~60° góc → đáng kể, đủ để khiến **centroid trộn chung** (single-slot) trở thành vector "ở giữa", không đại diện tốt cho cụm nào.
+
+→ Đây là cơ sở cho **dual-slot DB**: tách 2 cụm riêng → mỗi cụm chặt → cosine intra-class trong slot tăng từ ~0.45 lên ~0.65 → biên phân biệt với người khác rộng hơn.
+
+**Hệ quả phụ — vùng khẩu trang vẫn ảnh hưởng**:
+- Mask màu/họa tiết/loại khác nhau **vẫn tạo ra noise** trong embedding (vì pixel mask vẫn đi qua convolution).
+- Đó là lý do thực nghiệm thấy: cùng 1 người đeo 2 loại mask khác nhau → cosine có thể giảm xuống ~0.5; ngược lại 2 người khác nhau cùng đeo mask đen → cosine có thể tăng lên ~0.3 (vẫn dưới threshold nhưng gần hơn so với khi không mask).
+
+> **Phương án thay thế đã cân nhắc và bỏ qua**: crop riêng vùng periocular (mắt + trán) trước khi embed. Bỏ qua vì: (i) ArcFace pretrained trên ảnh full-face, embed periocular crop sẽ giảm chất lượng đáng kể; (ii) cần train periocular model chuyên dụng, vượt phạm vi đề tài. Xem `docs/report-explain.md` mục 8 (phương án D) để biết thêm.
+
+### Vì sao KHÔNG cắt vùng khẩu trang trước khi embed?
+
+Câu hỏi tự nhiên: "ArcFace dù sao cũng bị nhiễu bởi pixel khẩu trang — tại sao không tô đen / cắt vùng đó đi rồi mới embed?". Đã cân nhắc và **quyết định không làm**, vì:
+
+#### 1. ArcFace expect input đã được train phân phối — tô đen là **out-of-distribution**
+- ArcFace train trên crop 112×112 với khuôn mặt **tự nhiên** (kể cả có mask thật). Network học cách rút đặc trưng từ phân phối ảnh đó.
+- Nếu thay vùng khẩu trang bằng **pixel đen / xám / blur**, đó là phân phối **chưa từng thấy** trong training → activation các lớp conv tạo ra pattern lạ → embedding có thể **xấu hơn** so với để nguyên mask.
+- Glint360k đã có ảnh đeo mask thật → ArcFace ngầm học cách xử lý mask vải → **giữ nguyên mask hoạt động tốt hơn tô đen**.
+
+#### 2. Vùng khẩu trang KHÔNG hoàn toàn vô dụng — nó là **tín hiệu occlusion**
+- Network sâu nhận biết "khu vực này là vải mask" → tự ngầm **giảm trọng số** đặc trưng từ đó.
+- Nếu xoá hẳn → mất luôn tín hiệu này → network không biết phân biệt "đang occluded" vs "đang là một bộ phận khuôn mặt khác thường".
+
+#### 3. Cắt mask cần **segmentation chính xác** — thêm điểm fail
+- Biên khẩu trang không phải đường thẳng (có dây đeo, gấp vải, bóng đổ).
+- Cần thêm 1 model segmentation (vd U²-Net hoặc Mask R-CNN) — nặng, chậm, bias mới.
+- Mỗi 1 pixel segment sai → 1 vùng nhỏ bị tô nhầm → embedding shift theo cách không kiểm soát.
+
+#### 4. Phương án "crop chỉ vùng periocular" cũng có vấn đề riêng
+- Mất bố cục không gian ArcFace expect (mắt nằm ở vị trí cố định trên 112×112) → resize crop periocular lên 112×112 sẽ kéo giãn → embedding kém chất lượng.
+- Cần **fine-tune ArcFace** trên ảnh periocular — phải có dataset chuyên dụng + GPU + thời gian.
+- Thực nghiệm trong nghiên cứu (Neto et al. 2022): periocular embedding **cần model riêng**, dùng ArcFace full-face cho periocular crop **giảm 10–15% accuracy**.
+
+#### 5. Dual-slot DB là cách **hợp lý hơn** để giải quyết drift
+Thay vì can thiệp vào embedding bên trong, ta chấp nhận drift mask vs no_mask, và **xử lý ở cấp DB**:
+- Lưu 2 centroid riêng cho mỗi user → mỗi cụm chặt → cosine intra-class cao.
+- Không can thiệp vào ArcFace → giữ nguyên chất lượng pretrained.
+- Không cần segmentation → đơn giản hơn, ít điểm fail.
+
+#### Tóm tắt trade-off
+
+| Phương án | Ưu | Nhược | Quyết định |
+|---|---|---|---|
+| Tô đen vùng mask | Trực giác hợp lý | Out-of-distribution → embedding xấu hơn | ❌ Bỏ |
+| Inpaint (GAN tô lại) | Có thể "khôi phục" mặt | Hallucinate đặc trưng giả → identity sai | ❌ Bỏ |
+| Crop periocular | Tránh hẳn vùng mask | Cần fine-tune ArcFace, mất bố cục | ❌ Bỏ |
+| Multi-region + fusion | SOTA học thuật | Phức tạp, cần train model mới | ❌ Bỏ (vượt phạm vi) |
+| **Giữ nguyên + Dual-slot DB** | **Đơn giản, không can thiệp model, tận dụng pretrained** | Cosine giữa "cùng người, khác trạng thái mask" chỉ còn ~0.4–0.5 (so với ~0.7 khi cùng trạng thái) | ✅ **Chọn** |
+
+> **Kết luận**: cách "thông minh" hơn là **để pixel mask đi qua ArcFace như nó vốn được train**, rồi xử lý drift ở **cấp database** (dual-slot) thay vì cấp **input** (cắt/tô đen).
+
+**Lý do không train ArcFace**: pretrained Glint360k đã đủ tổng quát cho open-set recognition; train mới cần GPU lớn, dataset triệu ảnh — vượt tầm đồ án. Thay vào đó tập trung vào **kiến trúc pipeline** + **dual-slot DB** + **xử lý ảnh cổ điển**.
+
+### Dữ liệu
+
+| Loại | Mục đích | Khối lượng |
+|---|---|---|
+| Glint360k (pretrained) | ArcFace embedding | 17M ảnh, không tải ảnh gốc |
+| WIDER FACE (pretrained) | RetinaFace detect | 32k ảnh, không tải ảnh gốc |
+| **Face Mask 12k** (Kaggle) | Train YOLOv8n-cls | ~12k ảnh, 2 lớp WithMask/WithoutMask |
+| **Custom enrollment** | DB người dùng dự án | 5–10 ảnh / user × 2 trạng thái |
+| **MFR2** (benchmark) | Đánh giá dual-slot vs single-slot | 53 identities, 269 ảnh |
+
+### Kỹ thuật xử lý ảnh
+
+| Kỹ thuật | Vị trí | Mục đích |
+|---|---|---|
+| CLAHE (LAB-L) | Trước detect | Cân bằng sáng cục bộ |
+| Bbox expansion | Sau detect, trước YOLO | Bao đủ vùng cằm/khẩu trang |
+| FFT high-pass | Tiền xử lý periocular | Khuếch đại cạnh (tuỳ chọn) |
+| FFT low-pass | Tiền xử lý dataset | Khử JPEG artifact |
+| FFT magnitude | Feature texture | Phân biệt vải vs da |
+| Sobel / Laplacian variance | Lọc dataset train | Loại ảnh mờ |
+
+---
+
+## 4. Tổ chức lưu trữ
+
+```
+2D-Regonization-Mask/
+├── data/
+│   └── faces/                          ← ảnh thô enroll
+│       └── {user_id}/frame_*.jpg
+└── models/
+    ├── arcface_db.npz                  ← embeddings (binary, key={id}__{mask})
+    ├── arcface_names.json              ← mapping user_id → họ tên (UTF-8 JSON)
+    └── mask_yolov8n_cls.pt             ← weights YOLO mask classifier
+```
+
+### Cơ chế mapping 3 cấp
+
+```
+display_name "Nguyễn Văn A"
+    ↓ arcface_names.json
+user_id "NV20261"
+    ↓ + mask_label
+slot_key "NV20261__with_mask"
+    ↓ arcface_db.npz
+embedding [512] float32
+```
+
+### Quản trị
+| Thao tác | Cách làm |
 |---|---|
-| Mất thông tin vùng mũi, miệng, cằm | Giảm chất lượng embedding khuôn mặt |
-| Sự đa dạng của khẩu trang (màu, hình dạng) | Khó phân biệt mask/no\_mask chính xác |
-| Ánh sáng, góc chụp thay đổi | Tiền xử lý ảnh phức tạp hơn |
-| Dataset thiếu cân bằng | Bias mô hình về nhóm không đeo khẩu trang |
+| Thêm user | POST `/enroll` với `name` + `user_id` + ảnh |
+| Sửa họ tên | Edit `models/arcface_names.json` → restart |
+| Reset DB | `rm models/arcface_db.npz models/arcface_names.json && rm -rf data/faces/` |
+| Xem danh sách | GET `/health` |
 
 ---
 
-## 2. Mục tiêu đề tài
-
-1. **Phát hiện khuôn mặt** trong ảnh/video (cả khi đeo và không đeo khẩu trang).
-2. **Phân loại trạng thái khẩu trang**: `mask` / `no_mask` / `mask_incorrect` (đeo sai cách).
-3. **Định danh danh tính** của người dùng ngay cả khi đang đeo khẩu trang, bằng cách tập trung vào **vùng mắt và trán (periocular region)**.
-4. **Áp dụng kỹ thuật xử lý ảnh** (FFT, lọc tần số, OpenCV) vào các bước tiền xử lý và tăng cường dữ liệu.
-
----
-
-## 3. Pipeline tổng thể
-
-```
-Ảnh đầu vào
-     │
-     ▼
-┌─────────────────────────────┐
-│  1. TIỀN XỬ LÝ ẢNH          │  OpenCV: resize, cân bằng histogram (CLAHE),
-│     (Preprocessing)         │  khử nhiễu Gaussian, chuẩn hóa ánh sáng
-└────────────┬────────────────┘
-             │
-             ▼
-┌─────────────────────────────┐
-│  2. TĂNG CƯỜNG TẦN SỐ       │  FFT: phân tích phổ tần số, lọc thông cao
-│     (FFT Enhancement)       │  để làm rõ cạnh viền mắt, lông mày
-└────────────┬────────────────┘
-             │
-             ▼
-┌─────────────────────────────┐
-│  3. PHÁT HIỆN KHUÔN MẶT     │  MTCNN (facenet-pytorch):
-│     (Face Detection)        │  trả về bounding box + 5 landmarks
-└────────────┬────────────────┘
-             │
-             ├──────────────────────────────┐
-             ▼                              ▼
-┌────────────────────┐         ┌────────────────────────┐
-│  4a. PHÂN LOẠI     │         │  4b. CROP VÙNG MẮT     │
-│      KHẨU TRANG    │         │      (Periocular ROI)   │
-│  MobileNetV2       │         │  Dựa vào landmarks MTCNN│
-│  mask/no_mask      │         └────────────┬───────────┘
-└────────┬───────────┘                      │
-         │                                  ▼
-         │ (có mask)             ┌───────────────────────┐
-         └──────────────────────►│  5. NHẬN DIỆN DANH   │
-                                 │     TÍNH (Recognition)│
-                (không mask)     │  FaceNet Embedding    │
-         ┌──────────────────────►│  + SVM/kNN Classifier │
-         │  (dùng toàn bộ mặt)   └────────────┬──────────┘
-         │                                    │
-         ▼                                    ▼
-┌─────────────────────────────────────────────────────┐
-│  6. KẾT QUẢ: Bounding box + Trạng thái mask         │
-│     + Danh tính (nếu nhận ra) + Độ tin cậy          │
-└─────────────────────────────────────────────────────┘
-```
-
----
-
-## 4. Kiến thức áp dụng
-
-Mỗi kỹ thuật được chọn để giải quyết **một vấn đề cụ thể** trong pipeline. Bảng tổng quan:
-
-| Kỹ thuật | Vấn đề cần giải quyết | Dùng ở bước nào |
-|---|---|---|
-| Gaussian Blur | Ảnh webcam bị nhiễu làm MTCNN detect nhầm | Trước bước detect |
-| CLAHE | Vùng mắt tối, mờ khi ngược sáng | Trước bước detect + trước embedding |
-| Canny Edge | Trích đặc trưng viền mắt/lông mày cho periocular | Sau crop periocular |
-| Sobel | Đo độ mạnh gradient để chọn vùng ảnh sắc nét | Tiền xử lý training data |
-| Dilation | Vùng khẩu trang bị cắt do bounding box nhỏ quá | Sau khi detect mask region |
-| FFT lọc thông cao | Tăng rõ nét cạnh vùng mắt trước khi tạo embedding | Trước bước FaceNet khi có mask |
-| FFT lọc thông thấp | Khử nhiễu tần số cao từ ảnh nén JPEG kém | Tiền xử lý dataset training |
-| FFT magnitude | Texture vải khẩu trang có phổ tần số đặc trưng | Feature bổ sung cho mask classifier |
-| MTCNN | Detect khuôn mặt + 5 facial landmarks | Bước 3 pipeline chính |
-| MobileNetV2 | Phân loại mask/no\_mask | Bước 4a |
-| FaceNet | Tạo embedding 512-D biểu diễn danh tính | Bước 5 |
-| SVM | Phân loại danh tính từ embedding | Bước 5 |
-
----
-
-### 4.1 Gaussian Blur — Khử nhiễu trước khi detect
-
-**Vấn đề:** Webcam rẻ tiền, ảnh chụp ngoài trời hoặc điều kiện ánh sáng thay đổi thường có noise dạng hạt (salt-and-pepper, Gaussian noise). MTCNN dễ bị nhầm các vùng nhiễu thành khuôn mặt → sinh false positive.
-
-**Giải pháp:** Làm mịn ảnh bằng Gaussian Blur trước khi đưa vào detector. Kernel 3×3 đủ để khử noise nhỏ mà không làm mờ các cạnh quan trọng của khuôn mặt.
-
-```python
-# Áp dụng trước MTCNN detect
-blurred = cv2.GaussianBlur(img, (3, 3), sigmaX=0.8)
-```
-
----
-
-### 4.2 CLAHE — Cân bằng sáng tối cho vùng mắt
-
-**Vấn đề:** Khi nhận diện qua khẩu trang, hệ thống chỉ còn dựa vào **vùng mắt và trán**. Nếu người dùng đứng ngược sáng hoặc dưới ánh đèn yếu, vùng mắt trở nên tối và mờ → FaceNet tạo ra embedding kém chất lượng → nhận diện sai.
-
-**Giải pháp:** CLAHE (Contrast Limited Adaptive Histogram Equalization) cân bằng histogram **cục bộ theo từng ô nhỏ** (8×8 pixel), làm sáng vùng tối mà không làm cháy vùng đã sáng — khác với histogram equalization toàn cục vốn hay gây hiện tượng quá sáng.
-
-```python
-# Áp dụng sau khi crop vùng periocular (mắt + trán)
-clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-gray = cv2.cvtColor(periocular_crop, cv2.COLOR_BGR2GRAY)
-enhanced = clahe.apply(gray)
-# enhanced có độ tương phản vùng mắt tốt hơn, đưa vào FaceNet
-```
-
----
-
-### 4.3 Canny Edge Detection — Trích đặc trưng viền mắt/lông mày
-
-**Vấn đề:** Vùng periocular (mắt + lông mày) là nguồn thông tin sinh trắc học chính khi có khẩu trang. Cần làm nổi bật hình dạng mắt, viền lông mày để embedding mang nhiều thông tin danh tính hơn.
-
-**Giải pháp:** Canny phát hiện cạnh bằng 2 bước: (1) tính gradient Sobel để tìm vùng thay đổi cường độ mạnh, (2) non-maximum suppression + hysteresis thresholding để giữ lại đúng các cạnh sắc nét. Kết quả là ảnh nhị phân thể hiện rõ đường viền mắt, lông mày.
-
-Ảnh edge map này được **nối (concatenate) vào channel của ảnh gốc** trước khi đưa vào FaceNet, cung cấp thêm đặc trưng hình dạng bổ sung cho đặc trưng màu sắc:
-
-```python
-# Áp dụng sau CLAHE, trên vùng periocular đã crop
-edges = cv2.Canny(enhanced, threshold1=40, threshold2=120)
-# edges: ảnh 1 channel, giá trị 0 (nền) hoặc 255 (cạnh)
-
-# Ghép edge map làm kênh bổ sung
-periocular_rgb = cv2.cvtColor(periocular_crop, cv2.COLOR_BGR2RGB)
-edges_3ch = cv2.cvtColor(edges, cv2.COLOR_GRAY2RGB)
-combined = cv2.addWeighted(periocular_rgb, 0.85, edges_3ch, 0.15, 0)
-```
-
----
-
-### 4.4 Sobel — Đánh giá chất lượng ảnh trong preprocessing
-
-**Vấn đề:** Dataset thu thập từ nhiều nguồn có chất lượng không đồng đều — nhiều ảnh bị mờ (blur) do chuyển động hoặc lấy nét kém. Ảnh mờ → gradient yếu → embedding không ổn định → làm nhiễu quá trình training.
-
-**Giải pháp:** Dùng Sobel để tính **Laplacian variance** (độ sắc nét) của ảnh. Ảnh có variance thấp → bị mờ → loại khỏi dataset trước khi train.
-
-```python
-def is_sharp_enough(img_gray, threshold=80.0):
-    """Trả về True nếu ảnh đủ sắc nét để đưa vào training."""
-    laplacian = cv2.Laplacian(img_gray, cv2.CV_64F)
-    variance = laplacian.var()
-    return variance >= threshold
-
-# Lọc ảnh khi chuẩn bị dataset
-for img_path in dataset_images:
-    img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
-    if not is_sharp_enough(img):
-        print(f"Bỏ qua (mờ): {img_path}")
-        continue
-    # tiếp tục xử lý
-```
-
----
-
-### 4.5 Dilation — Sửa bounding box khẩu trang bị cắt
-
-**Vấn đề:** MTCNN trả về bounding box khuôn mặt, nhưng khi đeo khẩu trang, cằm thường bị cắt ra ngoài box. Nếu crop đúng bounding box của MTCNN, phần khẩu trang bị cắt bớt → mask classifier dễ nhầm `mask` thành `no_mask`.
-
-**Giải pháp:** Mở rộng bounding box xuống dưới thêm 15–20% chiều cao trước khi crop để đảm bảo bao gồm toàn bộ khẩu trang.
-
-```python
-def expand_box(box, img_h, img_w, expand_ratio=0.18):
-    """Mở rộng bounding box xuống dưới để bao trọn khẩu trang."""
-    x1, y1, x2, y2 = box
-    face_h = y2 - y1
-    y2_expanded = min(img_h - 1, y2 + int(face_h * expand_ratio))
-    return x1, y1, x2, y2_expanded
-```
-
----
-
-### 4.6 FFT lọc thông cao — Làm rõ cạnh vùng mắt trước embedding
-
-**Vấn đề:** Ảnh vùng periocular sau khi crop có kích thước nhỏ (khoảng 160×70 pixel). Khi resize lên 160×160 để đưa vào FaceNet, ảnh bị mờ do nội suy (interpolation). Thông tin cạnh mắt, lông mày bị nhòa → embedding kém đặc biệt hóa.
-
-**Giải pháp:** Trước khi resize, áp dụng **FFT lọc thông cao** để khuếch đại tần số cao (cạnh, chi tiết), bù lại phần bị mất khi resize.
-
-```python
-import numpy as np
-
-def fft_high_pass(img_gray, cutoff=30):
-    """Làm nổi cạnh viền mắt/lông mày bằng lọc thông cao trong miền tần số."""
-    f = np.fft.fft2(img_gray)
-    fshift = np.fft.fftshift(f)          # đưa tần số 0 (DC) vào giữa phổ
-
-    rows, cols = img_gray.shape
-    crow, ccol = rows // 2, cols // 2
-
-    # Mặt nạ: bỏ vùng tần số thấp ở trung tâm (bán kính = cutoff)
-    mask = np.ones((rows, cols), np.uint8)
-    mask[crow - cutoff:crow + cutoff, ccol - cutoff:ccol + cutoff] = 0
-
-    fshift_filtered = fshift * mask
-    img_back = np.abs(np.fft.ifft2(np.fft.ifftshift(fshift_filtered)))
-    return img_back.astype(np.float32)
-
-# Dùng sau crop periocular, trước khi resize + đưa vào FaceNet
-enhanced = fft_high_pass(periocular_gray, cutoff=25)
-```
-
----
-
-### 4.7 FFT lọc thông thấp — Khử nhiễu ảnh JPEG kém chất lượng
-
-**Vấn đề:** Ảnh tải từ internet hoặc camera an ninh thường được nén JPEG mạnh tạo ra nhiễu dạng block artifact (ô vuông). Nhiễu này là tần số cao ngẫu nhiên, không liên quan đến đặc trưng khuôn mặt, nhưng ảnh hưởng đến embedding của FaceNet.
-
-**Giải pháp:** FFT lọc thông thấp giữ lại tần số thấp (hình dạng tổng thể, màu sắc da, vị trí mắt) và loại bỏ tần số cao ngẫu nhiên từ artifact JPEG. Khác với Gaussian blur vì có thể kiểm soát chính xác ngưỡng tần số cắt.
-
-```python
-def fft_low_pass(img_gray, cutoff=50):
-    """Khử JPEG artifact bằng lọc thông thấp trong miền tần số."""
-    f = np.fft.fft2(img_gray)
-    fshift = np.fft.fftshift(f)
-
-    rows, cols = img_gray.shape
-    crow, ccol = rows // 2, cols // 2
-
-    # Mặt nạ: chỉ giữ vùng tần số thấp ở trung tâm
-    mask = np.zeros((rows, cols), np.uint8)
-    mask[crow - cutoff:crow + cutoff, ccol - cutoff:ccol + cutoff] = 1
-
-    fshift_filtered = fshift * mask
-    img_back = np.abs(np.fft.ifft2(np.fft.ifftshift(fshift_filtered)))
-    return img_back.astype(np.float32)
-```
-
----
-
-### 4.8 FFT magnitude spectrum — Feature phụ cho mask classifier
-
-**Vấn đề:** MobileNetV2 nhìn vào màu sắc và hình dạng để phân loại mask/no\_mask. Nhưng khẩu trang màu da hoặc in họa tiết khuôn mặt có thể đánh lừa mô hình nếu chỉ dựa vào màu.
-
-**Giải pháp:** Vải khẩu trang có **texture tuần hoàn** (sợi vải, lớp lọc) tạo ra các đỉnh năng lượng đặc trưng trong phổ FFT — khác hẳn với da mặt vốn là bề mặt không đồng đều. FFT magnitude spectrum được trích xuất làm **feature bổ sung** ghép vào vector đặc trưng của MobileNetV2.
-
-```python
-def fft_texture_feature(img_gray):
-    """Phổ biên độ FFT log-scale — phân biệt texture vải vs da mặt."""
-    f = np.fft.fft2(img_gray)
-    fshift = np.fft.fftshift(f)
-    magnitude = 20 * np.log(np.abs(fshift) + 1)   # log scale tránh giá trị quá lớn
-    # Resize về kích thước nhỏ cố định để làm feature vector
-    magnitude_resized = cv2.resize(magnitude, (32, 32))
-    return magnitude_resized.flatten()             # vector 1024 chiều
-```
-
----
-
-### 4.9 MTCNN — Phát hiện khuôn mặt + Facial Landmarks
-
-**Vấn đề:** Haar Cascade (phương pháp cổ điển) bị nhiễu khi người đeo khẩu trang vì pattern học từ khuôn mặt đầy đủ. MTCNN dùng 3 mạng CNN tầng (P-Net → R-Net → O-Net) xử lý từ thô đến tinh, trả về **5 facial landmarks** (mắt trái, mắt phải, mũi, miệng trái, miệng phải) — landmark chính là cơ sở để crop vùng periocular chính xác.
-
-```python
-from facenet_pytorch import MTCNN
-mtcnn = MTCNN(keep_all=True, post_process=False)
-
-# boxes: list bounding box [x1, y1, x2, y2]
-# probs: confidence score
-# landmarks: [[left_eye, right_eye, nose, mouth_left, mouth_right], ...]
-boxes, probs, landmarks = mtcnn.detect(pil_img, landmarks=True)
-```
-
----
-
-### 4.10 MobileNetV2 — Phân loại mask/no\_mask
-
-**Vấn đề:** Cần phân loại nhanh ảnh crop khuôn mặt thành `mask` / `no_mask`, chạy được trong thời gian thực trên CPU phổ thông.
-
-**Giải pháp:** MobileNetV2 pretrained trên ImageNet được **fine-tune** (transfer learning) bằng cách thay classification head cuối thành 2-class output. Toàn bộ backbone giữ nguyên weights ImageNet ở epoch đầu, sau đó unfreeze dần để tinh chỉnh.
-
-```
-Input 224×224 → MobileNetV2 backbone (frozen) → Global Avg Pool
-→ Dropout(0.2) → Linear(1280 → 2) → Softmax → [mask, no_mask]
-```
-
----
-
-### 4.11 FaceNet + SVM — Nhận diện danh tính
-
-**Vấn đề:** Nhận diện danh tính khi đeo khẩu trang — chỉ còn vùng mắt.
-
-**Giải pháp:**
-- **FaceNet (InceptionResnetV1)** pretrained trên VGGFace2 tạo embedding 512 chiều. Embedding là vector đặc trưng có tính chất: cùng người → khoảng cách cosine nhỏ, khác người → khoảng cách lớn.
-- **SVM** dùng embedding làm input, phân loại danh tính. Ưu điểm: thêm người mới chỉ cần enroll embedding mới và retrain SVM — **không cần retrain FaceNet**.
-
-```
-Ảnh vùng periocular (160×160)
-  → CLAHE + FFT high-pass
-  → FaceNet → embedding 512-D (L2-normalized)
-  → SVM.predict() → "Nguyen Van A" (confidence: 0.87)
-```
-
----
-
-## 5. Công nghệ và công cụ
-
-| Lớp | Công nghệ | Vai trò |
-|---|---|---|
-| **Phát hiện mặt** | MTCNN (`facenet-pytorch`) | Detect bounding box + 5 facial landmarks |
-| **Phân loại mask** | MobileNetV2 (PyTorch) | Transfer learning, 2-class head (mask/no\_mask) |
-| **Nhận diện danh tính** | FaceNet / InceptionResnetV1 | Tạo embedding 512 chiều từ khuôn mặt |
-| **Classifier** | SVM / kNN (`scikit-learn`) | Phân loại danh tính từ embedding |
-| **Xử lý ảnh** | OpenCV (`cv2`) | CLAHE, Canny, Sobel, Gaussian blur |
-| **Biến đổi tần số** | NumPy FFT (`np.fft`) | Lọc tần số, phân tích texture |
-| **Backend API** | FastAPI + Uvicorn | REST API nhận ảnh, trả kết quả JSON |
-| **Frontend** | HTML5 + JavaScript | Webcam capture, hiển thị bounding box |
-| **Quản lý model** | `joblib` | Lưu/load SVM classifier đã train |
-
-### Lý do lựa chọn
-
-- **MTCNN thay vì Haar Cascade**: Haar cascade tạo ra quá nhiều false positive với ảnh có khẩu trang (nhầm pattern vải thành khuôn mặt). MTCNN dùng deep learning, chính xác hơn và trả về landmarks.
-- **MobileNetV2 thay vì ResNet lớn**: Nhẹ, phù hợp inference real-time, đã pretrained trên ImageNet → transfer learning hiệu quả với dataset nhỏ.
-- **FaceNet + SVM thay vì end-to-end**: FaceNet cho embedding chất lượng cao; SVM cho phép thêm người mới vào hệ thống mà **không cần retrain toàn bộ mạng**.
-- **FFT (NumPy)**: Tích hợp trực tiếp vào pipeline Python, không cần thư viện ngoài, phù hợp cho tiền xử lý batch.
-
----
-
-## 6. Kiến trúc hệ thống
-
-```
-src/
-├── backend/
-│   └── app.py                  # FastAPI: /predict, /enroll, /health
-├── frontend/
-│   ├── index.html              # Giao diện webcam + upload
-│   └── main.js                 # Gửi ảnh, vẽ bounding box + identity
-├── inference/
-│   └── pipeline.py             # Pipeline chính: detect → classify → recognize
-├── models/
-│   ├── mask_classifier.py      # MobileNetV2 mask/no_mask
-│   ├── recognizer.py           # FaceNet embedding + SVM matching
-│   └── train_mask_detector.py  # Script training mask classifier
-└── preprocessing/
-    ├── fft_utils.py            # Hàm lọc tần số FFT
-    └── image_utils.py          # OpenCV CLAHE, Canny, Sobel
-
-data/
-├── raw_samples/                # Ảnh mẫu test nhanh
-├── raw_full/                   # Dataset đầy đủ (tải thủ công)
-├── processed/                  # Ảnh đã crop + resize 160x160
-├── preprocess.py               # MTCNN-based face crop pipeline
-└── download_datasets.py        # Helper tải dataset mẫu
-
-scripts/
-├── enroll.py                   # Enroll khuôn mặt mới vào hệ thống
-├── train_mask_classifier.py    # Train full MobileNetV2
-├── train_recognizer.py         # Build SVM classifier từ embeddings
-└── smoke_predict.py            # Smoke test gọi API /predict
-
-models/                         # Weights đã train (không commit lên git)
-├── mask_clf.pth                # MobileNetV2 fine-tuned
-└── recognizer.joblib           # SVM + LabelEncoder
-```
-
----
-
-## 7. Giải pháp chi tiết
-
-### 7.1 Tiền xử lý ảnh
-
-Trước khi đưa vào detector, mỗi frame ảnh được xử lý:
-
-1. **Resize** về kích thước chuẩn (nếu quá lớn) để giảm thời gian inference
-2. **CLAHE** — cân bằng histogram thích nghi, cải thiện độ tương phản vùng mắt trong điều kiện ánh sáng yếu
-3. **Gaussian blur nhẹ** (kernel 3×3) — khử noise salt-and-pepper từ webcam rẻ
-4. **Chuẩn hóa pixel** về `[0, 1]` hoặc `[-1, 1]` tùy mô hình
-
-### 7.2 Phân tích FFT
-
-Ảnh grayscale của vùng khuôn mặt được biến đổi FFT để:
-- **Lọc thông cao**: làm nổi bật cạnh viền mắt, lông mày → tăng chất lượng periocular embedding
-- **Phân tích texture**: vải khẩu trang tạo pattern tần số cao đặc trưng, dùng làm feature bổ sung cho mask classifier
-
-### 7.3 Chiến lược nhận diện khi có khẩu trang
-
-```
-Phát hiện mặt
-     │
-     ├── no_mask → Dùng toàn bộ khuôn mặt (160×160) → FaceNet embedding
-     │
-     └── mask    → Crop periocular (top 45% của bounding box)
-                   → FFT high-pass enhancement
-                   → Resize về 160×160
-                   → FaceNet embedding (periocular-only)
-```
-
-Vùng periocular chứa **mắt, lông mày, trán** — các đặc trưng sinh trắc học ổn định và ít bị ảnh hưởng bởi khẩu trang.
-
-### 7.4 Enrollment (Đăng ký khuôn mặt mới)
+## 5. Cài đặt
 
 ```bash
-python scripts/enroll.py --name "Nguyen Van A" --images data/person_a/
-```
-
-Script thực hiện:
-1. Detect + crop khuôn mặt từ tất cả ảnh đầu vào
-2. Tạo embedding FaceNet cho từng ảnh
-3. Thêm embeddings + label vào dataset
-4. Retrain SVM classifier
-5. Lưu `models/recognizer.joblib`
-
-### 7.5 Tăng cường dữ liệu (Data Augmentation)
-
-Để mô hình mask classifier robust hơn, dataset được augment:
-- **Synthetic mask**: gắn ảnh khẩu trang 2D lên khuôn mặt không đeo mask (dùng facial landmarks)
-- **Flip ngang**, thay đổi độ sáng, xoay nhẹ ±15°
-- **Thêm nhiễu Gaussian** mô phỏng camera chất lượng thấp
-
----
-
-## 8. Dataset
-
-| Dataset | Nội dung | Link |
-|---|---|---|
-| **MaskedFace-Net** | ~100k ảnh mặt đeo mask (synthetic) | [GitHub](https://github.com/aqeelanwar/MaskedFace-Net) |
-| **MAFA** | Ảnh mặt bị che một phần (mask, tay, vật thể) | [Link](http://www.escience.cn/people/JunweiHan/MAFA.html) |
-| **LFW** (Labeled Faces in the Wild) | Ảnh mặt không mask, dùng làm negative class | [Link](http://vis-www.cs.umass.edu/lfw/) |
-| **Custom** | Ảnh tự thu thập cho enrollment | Tự chụp |
-
-Tải dataset mẫu nhanh để test:
-
-```bash
-python data/download_datasets.py --sample --out data/raw_samples
-```
-
----
-
-## 9. Cài đặt và chạy thử
-
-### 9.1 Cài đặt môi trường
-
-```bash
-# Tạo virtualenv (khuyến nghị Python 3.10–3.12)
+# Tạo virtualenv (Python 3.10–3.14)
 python -m venv .venv
 source .venv/bin/activate        # macOS/Linux
 .venv\Scripts\activate           # Windows
@@ -475,76 +281,161 @@ source .venv/bin/activate        # macOS/Linux
 pip install -r requirements.txt
 ```
 
-### 9.2 Chạy backend
+**Lần đầu chạy** InsightFace sẽ tự tải `buffalo_l` (~280 MB) về `~/.insightface/models/`.
 
+---
+
+## 6. Cách chạy
+
+### 6.1 Backend
 ```bash
 uvicorn src.backend.app:app --reload --port 8000
 ```
 
-### 9.3 Chạy frontend
-
+### 6.2 Frontend
 ```bash
-cd src/frontend
-python -m http.server 8080
-# Mở trình duyệt: http://localhost:8080
+cd src/frontend && python -m http.server 8080
+# Mở http://localhost:8080
 ```
 
-### 9.4 Test API bằng script
-
+### 6.3 Test API
 ```bash
-# Smoke test với một ảnh
+# Health check
+curl http://localhost:8000/health
+
+# Predict 1 ảnh
+curl -X POST http://localhost:8000/predict -F "file=@/tmp/test.jpg" | python -m json.tool
+
+# Enroll user mới
+curl -X POST http://localhost:8000/enroll \
+  -F "name=Nguyễn Văn A" \
+  -F "user_id=NV20261" \
+  -F "files=@photo1.jpg" \
+  -F "files=@photo2.jpg"
+```
+
+> **Khuyến nghị enroll**: cho mỗi user chụp **3–5 ảnh không mask + 3–5 ảnh đeo mask** ở các góc/sáng khác nhau để cả 2 slot đều có dữ liệu chất lượng.
+
+### 6.4 Train mask classifier (đã có sẵn weights, chỉ chạy nếu muốn re-train)
+```bash
+python scripts/train_yolo_mask.py
+```
+Output: `models/mask_yolov8n_cls.pt`
+
+### 6.5 Benchmark dual-slot vs single-slot (trên MFR2)
+```bash
+python scripts/benchmark_mfr2.py
+```
+Output: `docs/benchmark-results.md`
+
+### 6.6 Smoke test pipeline
+```bash
 python scripts/smoke_predict.py --file data/raw_samples/sample_1.jpg
 ```
 
-### 9.5 Train mask classifier (sau khi có dataset)
+---
 
-```bash
-python scripts/train_mask_classifier.py \
-  --data data/processed \
-  --epochs 20 \
-  --out models/mask_clf.pth
+## 7. Cấu trúc thư mục
+
 ```
+src/
+├── backend/
+│   └── app.py                  # FastAPI: /health, /predict, /enroll
+├── frontend/
+│   ├── index.html              # Webcam capture + upload UI
+│   └── main.js                 # Vẽ bbox + render kết quả
+├── inference/
+│   └── pipeline_yolo.py        # Pipeline chính (đang dùng)
+├── models/                     # Code wrappers (legacy, tham khảo)
+└── preprocessing/
+    ├── fft_utils.py            # FFT high/low/magnitude
+    └── image_utils.py          # CLAHE, Canny, Sobel
 
-### 9.6 Enroll khuôn mặt mới
+scripts/
+├── benchmark_mfr2.py           # Đánh giá single vs dual slot
+├── train_yolo_mask.py          # Train YOLOv8n-cls
+├── enroll.py                   # CLI enroll (legacy, dùng /enroll API thay thế)
+└── smoke_predict.py            # Smoke test
 
-```bash
-python scripts/enroll.py --name "Ten Nguoi Dung" --images path/to/face_images/
+models/                         # Weights + DB (không commit)
+├── mask_yolov8n_cls.pt         # YOLO mask classifier (đã train)
+├── arcface_db.npz              # Dual-slot embedding DB
+└── arcface_names.json          # Mapping user_id → họ tên
+
+data/
+├── faces/{user_id}/*.jpg       # Ảnh enroll
+├── kaggle_raw/Face Mask Dataset/  # Dataset train mask
+├── yolo_cls/                   # Format chuẩn cho YOLO
+└── mfr2/mfr2/                  # Dataset benchmark (tải bằng gdown)
+
+docs/
+├── report-explain.md           # Báo cáo chi tiết kỹ thuật
+├── benchmark-results.md        # Kết quả benchmark MFR2
+├── pipeline-comparison.md      # So sánh pipeline cũ vs mới
+└── train-guideline.md          # Hướng dẫn training
 ```
 
 ---
 
-## 10. Kết quả kỳ vọng
+## 8. Tài liệu chi tiết
 
-| Chỉ số | Không đeo mask | Có đeo mask |
+| File | Nội dung |
+|---|---|
+| `docs/report-explain.md` | Giải thích đầy đủ kỹ thuật, mô hình, kiến trúc, câu hỏi phản biện, FAQ |
+| `docs/benchmark-results.md` | Kết quả benchmark dual-slot vs single-slot trên MFR2, phân tích trung thực |
+| `docs/pipeline-comparison.md` | So sánh pipeline cũ (MTCNN+FaceNet) vs mới |
+| `docs/train-guideline.md` | Hướng dẫn train YOLO mask classifier |
+| `docs/bao-cao-tien-do.md` | Báo cáo tiến độ |
+
+### Endpoint API
+
+| Method | Path | Mô tả |
 |---|---|---|
-| Tỉ lệ phát hiện khuôn mặt (MTCNN) | ≥ 95% | ≥ 88% |
-| Độ chính xác phân loại mask | — | ≥ 92% |
-| Độ chính xác nhận diện danh tính | ≥ 90% | ≥ 75% (periocular) |
-| Thời gian inference / frame | < 200 ms | < 250 ms |
+| GET | `/health` | Trạng thái + danh sách user đã enroll |
+| POST | `/predict` | Nhận ảnh → trả bbox + mask + identity |
+| POST | `/enroll` | Đăng ký user mới với `name` + `user_id` + ảnh |
 
-*Kết quả thực tế sẽ được cập nhật sau khi train và đánh giá trên test set.*
+### Schema response `/predict`
+```json
+{
+  "predictions": [
+    {
+      "box": [x1, y1, x2, y2],
+      "detection_score": 0.97,
+      "label": "with_mask",
+      "confidence": 1.00,
+      "identity": "NV20261",
+      "identity_name": "Nguyễn Văn A",
+      "identity_confidence": 0.52
+    }
+  ]
+}
+```
 
 ---
 
-## 11. Hạn chế và hướng phát triển
+## Hạn chế & hướng phát triển
 
-**Hạn chế hiện tại:**
-- FaceNet được pretrain trên ảnh mặt đầy đủ (VGGFace2), periocular-only làm giảm chất lượng embedding
-- Chưa xử lý trường hợp đeo kính cùng khẩu trang (che gần như toàn bộ mặt)
-- Chưa có luồng video real-time liên tục (chỉ capture theo yêu cầu)
+**Hạn chế**
+- Chưa có anti-spoofing (chiếu ảnh / video có thể qua mặt).
+- Chưa benchmark dual-slot trên dataset webcam thực (MFR2 không phản ánh điều kiện thực — xem `benchmark-results.md`).
+- DB lưu file phẳng, không scale lên >10k user.
+- Threshold cosine (0.35) chọn thực nghiệm, chưa tối ưu theo EER.
 
-**Hướng phát triển:**
-- Fine-tune FaceNet trên ảnh periocular để cải thiện nhận diện qua mask
-- Tích hợp nhận diện mống mắt (iris recognition) như feature bổ sung
-- Thêm stream video real-time với WebSocket
-- Triển khai mô hình nhẹ hơn (MobileNet embedding) để chạy trên thiết bị edge
+**Hướng phát triển**
+- Liveness detection (Silent-Face-Anti-Spoofing).
+- Face alignment trước embedding cho ảnh nghiêng.
+- WebSocket video stream realtime.
+- Frontend wizard 2 bước cho enroll (chụp không mask → đeo mask).
+- Fine-tune ArcFace trên ảnh masked nội bộ nếu thu thập đủ data.
 
 ---
 
 ## Tài liệu tham khảo
 
-- Schroff et al., *FaceNet: A Unified Embedding for Face Recognition and Clustering*, CVPR 2015
-- Sandler et al., *MobileNetV2: Inverted Residuals and Linear Bottlenecks*, CVPR 2018
-- Zhang et al., *Joint Face Detection and Alignment using Multi-task Cascaded CNNs*, 2016 (MTCNN)
-- Neto et al., *Beyond the Visible: A Survey on Cross-Spectral Face Recognition*, 2022
+- Deng et al., *ArcFace: Additive Angular Margin Loss for Deep Face Recognition*, CVPR 2019
+- Deng et al., *RetinaFace: Single-stage Dense Face Localisation in the Wild*, CVPR 2020
+- Jocher et al., *Ultralytics YOLOv8*, 2023
+- InsightFace project: https://github.com/deepinsight/insightface
+- MFR2 dataset (Anwar & Raychowdhury, *Masked Face Recognition for Secure Authentication*, 2020)
 - Gonzalez & Woods, *Digital Image Processing*, 4th Edition (FFT, spatial filtering)
